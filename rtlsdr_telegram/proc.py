@@ -176,12 +176,16 @@ class ManagedProcess:
 
 def run_capture(cmd: Iterable[str], timeout: float = 30, env: dict | None = None) -> tuple[int, str, str]:
     """Kısa ömürlü komutu çalıştırıp (rc, stdout, stderr) döndürür."""
+    def _dec(x):
+        if x is None:
+            return ""
+        return x.decode("utf-8", "replace") if isinstance(x, bytes) else x
     try:
         p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=timeout,
                           env={**os.environ, **(env or {})})
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired as e:
-        return 124, e.stdout or "", (e.stderr or "") + "\n[zaman aşımı]"
+        return 124, _dec(e.stdout), _dec(e.stderr) + "\n[zaman aşımı]"
     except FileNotFoundError:
         return 127, "", "komut bulunamadı"
     except OSError as e:

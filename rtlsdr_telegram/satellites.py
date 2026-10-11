@@ -48,6 +48,7 @@ class SatellitePredictor:
         self._ts = None
         self._topos = None
         self._sats: dict[str, EarthSatellite] = {}
+        self._tle_fail: dict[int, float] = {}
         if HAVE_SKYFIELD:
             self._ts = load.timescale()
             self._topos = wgs84.latlon(self.lat, self.lon, elevation_m=self.alt)
@@ -60,28 +61,82 @@ class SatellitePredictor:
     def _tle_path(self, norad: int) -> Path:
         return self.cache_dir / f"{norad}.tle"
 
+    def _tle_sources(self) -> list[str]:
+        """Denenecek TLE kaynak URL'leri (sırayla). {norad} yer tutucusu kullanılır."""
+        urls = self.sat_cfg.get("tle_urls")
+        if isinstance(urls, list) and urls:
+            return urls
+        single = self.sat_cfg.get("tle_url")
+        if single:
+            return [single]
+        return [
+            "https://tle.ivanstanojevic.me/api/tle/{norad}",
+            "https://celestrak.org/NORAD/elements/gp.php?CATNR={norad}&FORMAT=tle",
+        ]
+
+    @staticmethod
+    def _parse_tle_response(text: str) -> tuple[str, str] | None:
+        """Hem düz TLE metnini hem JSON (line1/line2) biçimini ayrıştırır."""
+        text = text.strip()
+        if text.startswith("{"):
+            try:
+                import json
+                d = json.loads(text)
+                l1, l2 = d.get("line1"), d.get("line2")
+                if l1 and l2:
+                    return l1.strip(), l2.strip()
+            except (ValueError, AttributeError):
+                return None
+            return None
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for i in range(len(lines) - 1):
+            if lines[i].startswith("1 ") and lines[i + 1].startswith("2 "):
+                return lines[i], lines[i + 1]
+        return None
+
     def get_tle(self, norad: int, name: str = "") -> tuple[str, str] | None:
-        """NORAD kimliği için (satır1, satır2) TLE döndürür; indirir/önbellekler."""
+        """NORAD kimliği için (satır1, satır2) TLE döndürür; indirir/önbellekler.
+
+        Birden çok kaynak sırayla denenir. Tüm kaynaklar başarısızsa, bir süre
+        (tle_retry_min) yeniden denenmez; varsa eski önbellek yine kullanılır."""
         path = self._tle_path(norad)
         max_age = float(self.sat_cfg.get("tle_max_age_h", 24)) * 3600
         if path.exists() and (time.time() - path.stat().st_mtime) < max_age:
-            return self._read_tle(path)
-        url = self.sat_cfg.get("tle_url", "").format(norad=norad)
-        if url:
+            cached = self._read_tle(path)
+            if cached:
+                return cached
+        # başarısızlık geri çekilmesi: son denemeden bu yana yeterli süre geçmediyse indirme
+        retry_s = float(self.sat_cfg.get("tle_retry_min", 30)) * 60
+        last_fail = self._tle_fail.get(norad, 0)
+        if time.time() - last_fail < retry_s:
+            return self._read_tle(path) if path.exists() else None
+
+        import httpx
+        for src in self._tle_sources():
             try:
-                import httpx
-                r = httpx.get(url, timeout=20, follow_redirects=True)
+                url = src.format(norad=norad)
+            except (KeyError, IndexError):
+                url = src
+            try:
+                r = httpx.get(url, timeout=15, follow_redirects=True,
+                              headers={"User-Agent": "rtlsdr-telegram/1.0"})
                 r.raise_for_status()
-                lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
-                if len(lines) >= 2:
-                    l1, l2 = (lines[-2], lines[-1])
-                    path.write_text("\n".join(lines[-3:] if len(lines) >= 3 else lines))
-                    return l1, l2
+                tle = self._parse_tle_response(r.text)
+                if tle:
+                    try:
+                        path.write_text(f"{name}\n{tle[0]}\n{tle[1]}\n")
+                    except OSError:
+                        pass
+                    self._tle_fail.pop(norad, None)
+                    return tle
             except Exception as e:
-                self.log.warning("TLE indirilemedi (NORAD %s): %s", norad, e)
-        if path.exists():
-            return self._read_tle(path)
-        return None
+                self.log.debug("TLE kaynağı başarısız (%s, NORAD %s): %s", url.split('/')[2] if '//' in url else url, norad, e)
+                continue
+        # tüm kaynaklar başarısız
+        self._tle_fail[norad] = time.time()
+        self.log.warning("TLE indirilemedi (NORAD %s) — tüm kaynaklar başarısız, %s dk sonra tekrar denenecek",
+                         norad, self.sat_cfg.get("tle_retry_min", 30))
+        return self._read_tle(path) if path.exists() else None
 
     @staticmethod
     def _read_tle(path: Path) -> tuple[str, str] | None:

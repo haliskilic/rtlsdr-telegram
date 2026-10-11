@@ -47,6 +47,15 @@ class MeteorTarget(TargetBase):
 
     # --------------------------------------------------- zamanlanmış pencere
     def next_window(self, now: float):
+        # pencereyi kısa süre önbelleğe al (scheduler her döngüde çağırır)
+        c = getattr(self, "_winc", None)
+        if c and (now - c[0]) < 120 and (c[1] is None or c[1][1] > now):
+            return c[1]
+        win = self._compute_window(now)
+        self._winc = (now, win)
+        return win
+
+    def _compute_window(self, now: float):
         if not self.predictor or not self.predictor.available:
             return None
         best = None

@@ -146,9 +146,36 @@ class Transcriber:
             self.log.warning("transkripsiyon hatası: %s", e)
             return TranscriptionResult(status="failed", detail=str(e))
 
+    @staticmethod
+    def _wav_to_array(wav: str):
+        """16 kHz mono WAV'ı faster-whisper için float32 numpy dizisine çevirir.
+
+        faster-whisper'a dosya yolu vermek PyAV kullanır ve sürüm uyumsuzluğunda
+        (metadata_errors) patlar; diziyi doğrudan vererek bu yolu baypas ederiz."""
+        import wave as _wave
+        import numpy as np
+        with _wave.open(wav, "rb") as w:
+            n = w.getnframes()
+            raw = w.readframes(n)
+            ch = w.getnchannels()
+            sw = w.getsampwidth()
+        if sw == 2:
+            a = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+        elif sw == 1:
+            a = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128) / 128.0
+        else:
+            a = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+        if ch > 1:
+            a = a.reshape(-1, ch).mean(axis=1)
+        return a
+
     def _transcribe_fw(self, wav: str, lang: str | None, prompt: str | None) -> TranscriptionResult:
+        try:
+            audio = self._wav_to_array(wav)
+        except Exception:
+            audio = wav  # son çare: dosya yolu (PyAV)
         segments, info = self._model.transcribe(
-            wav, language=lang, beam_size=self.beam_size, vad_filter=self.vad,
+            audio, language=lang, beam_size=self.beam_size, vad_filter=self.vad,
             initial_prompt=prompt, condition_on_previous_text=False)
         text = " ".join(s.text.strip() for s in segments).strip()
         return TranscriptionResult(text, getattr(info, "language", lang), "done")

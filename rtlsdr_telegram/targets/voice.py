@@ -82,8 +82,10 @@ class VoiceTargetBase(TargetBase):
             threshold_dbfs=thr, hangover_s=float(self.conf.get("hangover_s", 1.5)),
             min_segment_s=float(self.conf.get("min_segment_s", 0.8)),
             max_segment_s=float(self.conf.get("max_segment_s", 120)),
-            gain=self.conf.get("gain", "auto"), channel=cname,
-            prefix=self.KEY)
+            gain=self.conf.get("gain", "auto"), squelch=int(self.conf.get("squelch", 0)),
+            channel=cname, prefix=self.KEY,
+            require_dynamics=bool(self.conf.get("require_dynamics", True)),
+            min_dynamics_db=float(self.conf.get("min_dynamics_db", 2.5)))
         for seg in segs:
             self._emit_segment(seg, freq_mhz, cname)
 

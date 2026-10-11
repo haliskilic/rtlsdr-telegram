@@ -72,7 +72,8 @@ class AudioRecorder:
                       mode: str = "fm", audio_rate: int = 16000, threshold_dbfs: float = -45.0,
                       hangover_s: float = 1.5, min_segment_s: float = 0.6,
                       max_segment_s: float = 120.0, gain=None, squelch: int = 0,
-                      channel: str | None = None, prefix: str = "rec") -> list[Segment]:
+                      channel: str | None = None, prefix: str = "rec",
+                      require_dynamics: bool = True, min_dynamics_db: float = 2.5) -> list[Segment]:
         """Pencere boyunca kayıt yapıp tamamlanan segmentleri döndürür."""
         try:
             cmd = self.sdr.rtl_fm_cmd(freq_hz, mode=mode, sample_rate=audio_rate,
@@ -100,19 +101,32 @@ class AudioRecorder:
         peak = -120.0
         acc_lin = 0.0
         acc_n = 0
+        levels: list[float] = []
 
         def finalize():
-            nonlocal buf, peak, acc_lin, acc_n, active
+            nonlocal buf, peak, acc_lin, acc_n, active, levels
             dur = len(buf) / bytes_per_s
-            if dur >= min_segment_s:
+            # Dinamik-aralık (dynamics) kapısı: FM statiği/taşıyıcısı düz seviyelidir;
+            # gerçek konuşma hecelerle dalgalanır. Seviye std sapması düşükse (düz),
+            # muhtemelen gürültü/taşıyıcıdır — reddet. (min_dynamics_db ile ayarlanır)
+            flat = False
+            if require_dynamics and len(levels) >= 4:
+                m = sum(levels) / len(levels)
+                var = sum((x - m) ** 2 for x in levels) / len(levels)
+                std = var ** 0.5
+                flat = std < min_dynamics_db
+            if dur >= min_segment_s and not flat:
                 seg = self._write_segment(bytes(buf), audio_rate, freq_hz, seg_start, dur,
                                           peak, acc_lin, acc_n, channel, prefix)
                 if seg:
                     segments.append(seg)
+            elif flat:
+                self.log.debug("segment reddedildi (düz seviye, muhtemelen statik): std<%.1f dB", min_dynamics_db)
             buf = bytearray()
             peak = -120.0
             acc_lin = 0.0
             acc_n = 0
+            levels = []
             active = False
 
         try:
@@ -138,6 +152,7 @@ class AudioRecorder:
                     peak = max(peak, lvl)
                     acc_lin += 10 ** (lvl / 10)
                     acc_n += 1
+                    levels.append(lvl)
                     if len(buf) / bytes_per_s >= max_segment_s:
                         finalize()
                 elif active:

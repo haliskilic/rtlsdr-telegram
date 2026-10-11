@@ -145,7 +145,8 @@ class EmergencyTarget(TargetBase):
             segs = self.audio.record_window(freq_hz, 10, stop_event, mode="am", audio_rate=16000,
                                             threshold_dbfs=self.conf.get("threshold_121_5_dbfs", -35.0) - 5,
                                             hangover_s=2.0, min_segment_s=0.5, max_segment_s=15,
-                                            gain=self.conf.get("gain", 40), prefix="emerg121")
+                                            gain=self.conf.get("gain", 40), prefix="emerg121",
+                                            require_dynamics=False)
             for s in segs:
                 atts.append(Attachment("voice", s.final_path, caption="121.5 MHz kaydı"))
                 dur += s.duration_s

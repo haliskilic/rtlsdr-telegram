@@ -103,8 +103,13 @@ DEFAULTS: dict[str, Any] = {
     },
     "summary": {"enabled": True, "time": "09:00", "attach_csv": True, "top_n": 5},
     "satellites": {
-        "tle_url": "https://celestrak.org/NORAD/elements/gp.php?CATNR={norad}&FORMAT=tle",
+        # Sırayla denenecek kaynaklar ({norad} yer tutucusu). İlk çalışan kullanılır.
+        "tle_urls": [
+            "https://tle.ivanstanojevic.me/api/tle/{norad}",
+            "https://celestrak.org/NORAD/elements/gp.php?CATNR={norad}&FORMAT=tle",
+        ],
         "tle_max_age_h": 24,
+        "tle_retry_min": 30,     # tüm kaynaklar başarısızsa bu kadar dk sonra tekrar dene
         "lookahead_h": 24,
         "refresh_min": 60,
     },

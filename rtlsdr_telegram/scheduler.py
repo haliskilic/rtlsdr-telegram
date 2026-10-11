@@ -272,6 +272,7 @@ class Scheduler:
         before = target.event_count
         try:
             with self.sdr.lease(target.KEY):
+                self.sdr.note_device_ok()
                 target.run_slot(self._combined_stop(), duration)
         except Exception as e:
             self.log.exception("hedef '%s' çöktü: %s", target.KEY, e)
@@ -298,7 +299,8 @@ class Scheduler:
                 segs = recorder.record_window(freq_hz, req.seconds, self._combined_stop(),
                                               mode=req.mode, audio_rate=16000, threshold_dbfs=-46.0,
                                               hangover_s=1.5, min_segment_s=0.5, max_segment_s=req.seconds,
-                                              gain=self.sdr.gain, channel=None, prefix="adhoc")
+                                              gain=self.sdr.gain, channel=None, prefix="adhoc",
+                                              require_dynamics=False)
         except Exception as e:
             self.log.warning("ad-hoc tarama hatası: %s", e)
             segs = []

@@ -65,6 +65,8 @@ class SdrManager:
         self._owner: str | None = None
         self._owner_since = 0.0
         self.info: DeviceInfo | None = None
+        self._probe_ts = 0.0
+        self._probe_ttl = 30.0
         # Harici araç yolları
         self.bin_rtl_test = which("rtl_test")
         self.bin_rtl_fm = which("rtl_fm")
@@ -73,17 +75,40 @@ class SdrManager:
         self.bin_rtl_eeprom = which("rtl_eeprom")
 
     # --------------------------------------------------------------- donanım
-    def probe(self) -> DeviceInfo:
-        """rtl_test ile dongle'ı yoklar. Dongle kullanımdaysa 'meşgul' döndürür."""
+    def probe(self, force: bool = False) -> DeviceInfo:
+        """rtl_test ile dongle'ı yoklar. Dongle kullanımdaysa 'meşgul' döndürür.
+
+        rtl_test kendiliğinden çıkmaz (sürekli örnekleme testi yapar); bu yüzden
+        çıktısını kısa süre okuyup süreci sonlandırırız. Sonuç kısa süre
+        önbelleğe alınır (scheduler her döngüde çağırır)."""
+        now = time.time()
+        if not force and self.info is not None and (now - self._probe_ts) < self._probe_ttl:
+            return self.info
         if not self.bin_rtl_test:
             self.info = DeviceInfo(False, detail="rtl_test bulunamadı (rtl-sdr kurulu değil)")
+            self._probe_ts = now
             return self.info
-        rc, out, err = run_capture([self.bin_rtl_test], timeout=4)
-        text = out + "\n" + err
-        # rtl_test kısa sürede "Found N device(s)" yazar; sonra örnekleme testine geçer.
+        lines: list[str] = []
+        from ..proc import ManagedProcess
+        proc = ManagedProcess([self.bin_rtl_test], name="rtl_test",
+                              on_stderr=lambda l: lines.append(l))
+        try:
+            proc.start()
+            deadline = now + 3.0
+            while time.time() < deadline:
+                text_now = "\n".join(lines)
+                if "Sampling at" in text_now or "No supported devices" in text_now or "usb_claim" in text_now:
+                    break
+                if not proc.running:
+                    break
+                time.sleep(0.1)
+        finally:
+            proc.stop(timeout=2)
+        text = "\n".join(lines)
+        self._probe_ts = time.time()
         m = re.search(r"Found (\d+) device", text)
         if not m or int(m.group(1)) == 0:
-            if "usb_claim_interface error" in text or "Device or resource busy" in text:
+            if "usb_claim_interface error" in text or "Device or resource busy" in text or "usb_open error" in text:
                 self.info = DeviceInfo(True, detail="dongle meşgul (başka süreç kullanıyor olabilir)")
                 return self.info
             self.info = DeviceInfo(False, detail="dongle bulunamadı")
@@ -93,16 +118,24 @@ class SdrManager:
             dm = re.match(r"\s*(\d+):\s+(.*?),\s+(.*?),\s+SN:\s*(\S+)", line)
             if dm and int(dm.group(1)) == self.device_index:
                 name, serial = dm.group(3).strip(), dm.group(4).strip()
-            tm = re.search(r"Found (.*?) tuner", text)
-            if tm:
-                tuner = tm.group(1).strip()
+        tm = re.search(r"Found (.*?) tuner", text)
+        if tm:
+            tuner = tm.group(1).strip()
         self.info = DeviceInfo(True, self.device_index, name, tuner, serial,
                                detail=f"{name or 'RTL-SDR'} / {tuner or 'bilinmeyen tuner'}")
         return self.info
 
     def device_present(self) -> bool:
+        # dongle o an kiralıysa (bir hedef kullanıyorsa) kesinlikle var
+        if self._owner is not None:
+            return True
         info = self.probe()
         return info.present
+
+    def note_device_ok(self) -> None:
+        """Bir hedef dongle'ı başarıyla kullandı — mevcut say, yoklamayı tazele."""
+        self.info = DeviceInfo(True, self.device_index, detail=(self.info.detail if self.info else "RTL-SDR"))
+        self._probe_ts = time.time()
 
     # ----------------------------------------------------------- kiralama
     def lease(self, owner: str) -> DeviceLease:

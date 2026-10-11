@@ -41,6 +41,14 @@ class ISSTarget(TargetBase):
         return ok, ("" if ok else "rtl_fm yok")
 
     def next_window(self, now: float):
+        c = getattr(self, "_winc", None)
+        if c and (now - c[0]) < 120 and (c[1] is None or c[1][1] > now):
+            return c[1]
+        win = self._compute_window(now)
+        self._winc = (now, win)
+        return win
+
+    def _compute_window(self, now: float):
         if not self.predictor or not self.predictor.available:
             return None
         p = self.predictor.next_pass(self.conf.get("norad", 25544), "ISS",
@@ -74,7 +82,8 @@ class ISSTarget(TargetBase):
             freq_hz, duration_s, stop_event, mode="fm", audio_rate=16000,
             threshold_dbfs=float(self.conf.get("threshold_dbfs", -42.0)),
             hangover_s=3.0, min_segment_s=1.0, max_segment_s=max(60, p.duration_s),
-            gain=self.conf.get("gain", "auto"), channel="ISS 145.800", prefix="iss")
+            gain=self.conf.get("gain", "auto"), channel="ISS 145.800", prefix="iss",
+            require_dynamics=False)
         if not segs:
             self._no_signal(p)
             return
