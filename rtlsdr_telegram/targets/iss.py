@@ -67,19 +67,43 @@ class ISSTarget(TargetBase):
             return
         p = getattr(self, "_pending", None)
         if not p:
-            self.next_window(time.time())
+            # bypass next_window(): its cache does not refresh _pending
+            self._compute_window(time.time())
             p = getattr(self, "_pending", None)
             if not p:
                 return
+        set_ts = p.set.timestamp()
+        key = int(set_ts)
+        if key == getattr(self, "_done_key", None):
+            self._pending = None
+            self.pass_done_until(set_ts)
+            return
         mode = self.conf.get("mode", "voice")
         self.log.info("ISS pass: max elevation %.0f°, %.0f s, mode=%s", p.max_elevation, p.duration_s, mode)
+        started = time.time()
         if mode == "aprs":
-            self._run_aprs(stop_event, duration_s, p)
+            got = self._run_aprs(stop_event, duration_s, p)
         else:
-            self._run_voice(stop_event, duration_s, p, sstv=(mode == "sstv"))
+            got = self._run_voice(stop_event, duration_s, p, sstv=(mode == "sstv"))
+        ran_s = time.time() - started
+        remaining = set_ts - time.time()
+        if not got and remaining > 90:
+            if stop_event.is_set():
+                self.pass_retry_in(5)  # pre-empted by an ad-hoc scan: resume afterwards
+                return
+            if ran_s < 20 and getattr(self, "_retry_key", None) != key:
+                # recorder/rtl_fm failed to start: one retry after a back-off
+                self._retry_key = key
+                self.pass_retry_in(45)
+                return
+        # one report per pass, then leave the dongle alone until the window ends
+        self._done_key = key
         self._pending = None
+        self.pass_done_until(set_ts)
+        if not got:
+            self._no_signal(p)
 
-    def _run_voice(self, stop_event, duration_s, p, sstv=False):
+    def _run_voice(self, stop_event, duration_s, p, sstv=False) -> bool:
         freq_hz = int(self.conf.get("voice_freq_mhz", 145.8) * 1e6)
         segs = self.audio.record_window(
             freq_hz, duration_s, stop_event, mode="fm", audio_rate=16000,
@@ -88,8 +112,7 @@ class ISSTarget(TargetBase):
             gain=self.conf.get("gain", "auto"), channel="ISS 145.800", prefix="iss",
             require_dynamics=False)
         if not segs:
-            self._no_signal(p)
-            return
+            return False
         for seg in segs:
             atts = [audio_attachment(seg.final_path, caption=t("iss.caption"))]
             images = self._try_sstv(seg.final_path) if sstv else []
@@ -108,6 +131,7 @@ class ISSTarget(TargetBase):
             ev.transcription_language = self.conf.get("transcribe_language", "en")
             ev.extra["recording_id"] = rec_id
             self.emit(ev)
+        return True
 
     def _try_sstv(self, wav_path: str) -> list[str]:
         cmd_tmpl = self.conf.get("sstv_decoder_cmd", "")
@@ -136,7 +160,7 @@ class ISSTarget(TargetBase):
         shutil.rmtree(outdir, ignore_errors=True)
         return imgs
 
-    def _run_aprs(self, stop_event, duration_s, p):
+    def _run_aprs(self, stop_event, duration_s, p) -> bool:
         from .aprs import APRSTarget
         freq_hz = int(self.conf.get("aprs_freq_mhz", 145.825) * 1e6)
         rate = 22050
@@ -144,8 +168,7 @@ class ISSTarget(TargetBase):
                                   gain=self.conf.get("gain", "auto"))
         mm = self.cfg.which("multimon-ng")
         if not mm:
-            self._no_signal(p)
-            return
+            return False
         pipeline = " ".join("'" + str(x).replace("'", "'\\''") + "'" if " " in str(x) else str(x) for x in rtl)
         pipeline += f" | {mm} -t raw -a AFSK1200 -A -"
         count = {"n": 0}
@@ -161,8 +184,7 @@ class ISSTarget(TargetBase):
                 self.emit(ev)
         self.run_tool_lines(shell_pipeline(pipeline), stop_event, duration_s, on_line,
                             name="iss-aprs", log_name="iss")
-        if count["n"] == 0:
-            self._no_signal(p)
+        return count["n"] > 0
 
     def _no_signal(self, p):
         ev = self.make_event(

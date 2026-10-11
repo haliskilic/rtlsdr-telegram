@@ -54,6 +54,21 @@ def which(*names: str) -> str | None:
     return None
 
 
+def tool_env(extra: dict | None = None) -> dict:
+    """Environment for child tools: the current one plus `extra`, with HOME guaranteed.
+
+    systemd does not export $HOME for root services without User=; SatDump (and any
+    tool that builds "~/.config/..." paths) then aborts at start with
+    "basic_string: construction from null is not valid"."""
+    env = {**os.environ, **(extra or {})}
+    if not env.get("HOME"):
+        try:
+            env["HOME"] = os.path.expanduser("~")
+        except Exception:
+            pass
+    return env
+
+
 class ManagedProcess:
     """Start a subprocess and forward stdout lines to a callback.
 
@@ -70,7 +85,7 @@ class ManagedProcess:
         self.on_line = on_line
         self.on_stderr = on_stderr
         self.log_path = Path(log_path) if log_path else None
-        self.env = {**os.environ, **(env or {})}
+        self.env = tool_env(env)
         self.cwd = str(cwd) if cwd else None
         self.text_stdout = text_stdout
         self.proc: subprocess.Popen | None = None
@@ -280,7 +295,7 @@ def run_capture(cmd: Iterable[str], timeout: float = 30, env: dict | None = None
         return x.decode("utf-8", "replace") if isinstance(x, bytes) else x
     try:
         p = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, timeout=timeout,
-                          env={**os.environ, **(env or {})})
+                          env=tool_env(env))
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired as e:
         return 124, _dec(e.stdout), _dec(e.stderr) + "\n[timeout]"

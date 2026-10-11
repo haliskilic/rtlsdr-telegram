@@ -36,10 +36,11 @@ class GSMTarget(TargetBase):
     CATEGORY = Category.HUCRESEL
     CLASS = "opportunistic"
     DEFAULTS = {
-        "enabled": True, "priority": 6, "dwell_s": 180, "period_s": 3600,
+        "enabled": True, "priority": 6, "dwell_s": 300, "period_s": 3600,
         # grgsm_scanner prints its results only when a band scan COMPLETES, so the
-        # dwell must cover the whole band: GSM900 (173 ARFCNs) ~1 min at speed 27,
-        # DCS1800 (374 ARFCNs) needs ~3 min more — add it with a longer dwell_s.
+        # dwell must cover the whole band: GSM900 (174 ARFCNs) takes ~80-90 s at
+        # speed 27 on an idle CPU and 2-3x longer while transcription keeps the CPU
+        # busy; DCS1800 (374 ARFCNs) needs ~3 min more — add it with a longer dwell_s.
         "bands": ["GSM900"], "gain": 40, "sample_rate": 2000000,
         "speed": 27,                 # grgsm_scanner --speed 0-29 (higher = faster, less sensitive)
         "report_changed": True,

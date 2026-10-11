@@ -6,6 +6,7 @@ errors are logged.
 """
 from __future__ import annotations
 
+import os
 import signal
 import threading
 import time
@@ -28,8 +29,18 @@ from .events import Event, Category, PRIO_IMPORTANT, LEGACY_TR_TO_KEY
 from .i18n import t, set_language
 
 
+def _ensure_home() -> None:
+    """systemd does not export $HOME for root services; SatDump aborts without it."""
+    if not os.environ.get("HOME"):
+        try:
+            os.environ["HOME"] = os.path.expanduser("~")
+        except Exception:
+            pass
+
+
 class Application:
     def __init__(self, config_path: str | None = None):
+        _ensure_home()
         self.cfg: Config = load_config(config_path)
         self.cfg.ensure_dirs()
         self.log = setup_logging(self.cfg.log_dir, self.cfg.get("paths.log_level", "INFO"))

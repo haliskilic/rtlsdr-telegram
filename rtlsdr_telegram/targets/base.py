@@ -51,6 +51,9 @@ class TargetBase:
     CLASS: str = "opportunistic"
     #: target-specific default configuration (registered into config DEFAULTS)
     DEFAULTS: dict = {}
+    #: 'pass' targets: the scheduler leaves the target alone until this timestamp
+    #: (retry back-off after a failed start, or "done" until the window ends)
+    pass_retry_after: float = 0.0
 
     def __init__(self, key: str, ctx: TargetContext):
         self.KEY = key
@@ -226,6 +229,14 @@ class TargetBase:
     def next_window(self, now: float):
         """Next scheduled window (start, end) for 'pass' targets, else None."""
         return None
+
+    def pass_retry_in(self, seconds: float) -> None:
+        """'pass' targets: give the dongle back to the cycle and try again after `seconds`."""
+        self.pass_retry_after = time.time() + float(seconds)
+
+    def pass_done_until(self, until_ts: float) -> None:
+        """'pass' targets: nothing more to do in this window (success or final failure)."""
+        self.pass_retry_after = float(until_ts) + 1.0
 
 
 

@@ -246,6 +246,8 @@ class Scheduler:
                 continue
             if not t.check_tools():
                 continue
+            if getattr(t, "pass_retry_after", 0.0) > now:
+                continue  # attempted/finished for now: do not hold the dongle idle inside the window
             win = t.next_window(now)
             if not win:
                 continue

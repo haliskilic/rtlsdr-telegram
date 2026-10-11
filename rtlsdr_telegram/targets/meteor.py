@@ -73,22 +73,59 @@ class MeteorTarget(TargetBase):
         self._pending = (p, sat)
         return p.rise.timestamp(), p.set.timestamp()
 
+    MAX_ATTEMPTS = 2   # SatDump start attempts per pass
+    RETRY_S = 45       # back-off before the second attempt (the cycle gets the dongle meanwhile)
+
     def run_slot(self, stop_event: threading.Event, duration_s: float) -> None:
         if not self.check_tools():
             return
         pending = getattr(self, "_pending", None)
         if not pending:
-            w = self.next_window(time.time())
+            # bypass next_window(): its cache does not refresh _pending
+            self._compute_window(time.time())
             pending = getattr(self, "_pending", None)
             if not pending:
                 return
         p, sat = pending
-        self._run_pass(p, sat, stop_event, duration_s)
+        set_ts = p.set.timestamp()
+        key = (sat["name"], int(set_ts))
+        if key == getattr(self, "_done_key", None):
+            # already handled in this window (safety net: the scheduler should not call us)
+            self._pending = None
+            self.pass_done_until(set_ts)
+            return
+        if getattr(self, "_attempt_key", None) != key:
+            self._attempt_key, self._attempts = key, 0
+        self._attempts += 1
+        started = time.time()
+        rc, images = self._run_pass(p, sat, stop_event, duration_s)
+        ran_s = time.time() - started
+        remaining = set_ts - time.time()
+        if not images and remaining > 90:
+            if stop_event.is_set():
+                # pre-empted (ad-hoc scan): resume the pass right after it
+                self.pass_retry_in(5)
+                return
+            if rc != 0 and ran_s < 20 and self._attempts < self.MAX_ATTEMPTS:
+                # crash / dongle busy: hand the dongle to the cycle, try once more later
+                self.log.warning("satdump failed to start (rc=%s); retrying in %d s", rc, self.RETRY_S)
+                self.pass_retry_in(self.RETRY_S)
+                return
+        # one report per pass, then leave the dongle alone until the window ends
+        self._done_key = key
         self._pending = None
+        self.pass_done_until(set_ts)
+        if images:
+            self._report_images(images, sat, p)
+        else:
+            self._report_no_image(sat, p, rc, tool_failed=(rc not in (0, None) and ran_s < 20))
 
-    def _run_pass(self, p, sat, stop_event, duration_s):
+    def _run_pass(self, p, sat, stop_event, duration_s) -> tuple[int, list[str]]:
+        """Run SatDump for the pass; returns (exit code, kept image paths)."""
         binary = self.cfg.which("satdump")
-        outdir = Path(tempfile.mkdtemp(prefix="meteor_", dir=str(self.cfg.data_dir / "tmp")))
+        tmp_root = self.cfg.data_dir / "tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        outdir = Path(tempfile.mkdtemp(prefix="meteor_", dir=str(tmp_root)))
         freq_hz = int(sat["freq_mhz"] * 1e6)
         sr = int(self.conf.get("samplerate", 1024000))
         timeout = int(min(duration_s, max(60, p.duration_s)))
@@ -100,17 +137,15 @@ class MeteorTarget(TargetBase):
         self.log.info("Meteor pass: %s, max elevation %.0f°, %.0f s", sat["name"], p.max_elevation, p.duration_s)
         rc = self.run_tool_lines(cmd, stop_event, timeout + 15, lambda l: None,
                                  name="satdump", log_name="satdump")
-        self._collect(outdir, sat, p)
-        try:
-            shutil.rmtree(outdir, ignore_errors=True)
-        except OSError:
-            pass
+        images = self._keep_images(outdir, sat)
+        shutil.rmtree(outdir, ignore_errors=True)
+        return rc, images
 
-    def _collect(self, outdir: Path, sat, p):
+    def _keep_images(self, outdir: Path, sat) -> list[str]:
+        """Copy the useful product images out of the temporary directory; returns kept paths."""
         imgs = []
         for ext in ("*.png", "**/*.png"):
             imgs.extend(glob.glob(str(outdir / ext), recursive=True))
-        # drop duplicates, filter by size
         seen = set()
         uniq = []
         for img in sorted(imgs):
@@ -125,32 +160,39 @@ class MeteorTarget(TargetBase):
                 continue
             uniq.append(img)
         if not uniq:
-            self.log.info("Meteor pass produced no image (%s)", sat["name"])
-            ev = self.make_event(
-                self.display_name(), summary=t("meteor.no_image_summary", sat=sat["name"]),
-                body=t("meteor.no_image_body", el=f"{p.max_elevation:.0f}"),
-                freq_mhz=sat["freq_mhz"], priority=self.priority)
-            self.emit(ev)
-            return
+            return []
         maxn = int(self.conf.get("max_images", 6))
         # prefer 'corrected'/'rgb' products
         uniq.sort(key=lambda s: (("corrected" not in s.lower()), ("221" not in s and "rgb" not in s.lower()), s))
-        chosen = uniq[:maxn]
         kept_dir = self.cfg.recordings_dir / "meteor"
         kept_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M")
-        atts = []
-        for i, img in enumerate(chosen):
+        kept = []
+        for i, img in enumerate(uniq[:maxn]):
             dst = kept_dir / f"{sat['name'].replace(' ', '_')}_{stamp}_{i}_{os.path.basename(img)}"
             try:
                 shutil.copy2(img, dst)
-            except OSError:
-                dst = Path(img)
-            atts.append(Attachment("photo", str(dst), caption=f"{sat['name']} — {os.path.basename(img)}"))
+                kept.append(str(dst))
+            except OSError as e:
+                self.log.warning("could not keep image %s: %s", img, e)
+        return kept
+
+    def _report_images(self, images: list[str], sat, p) -> None:
+        atts = [Attachment("photo", img, caption=f"{sat['name']} — {os.path.basename(img)}") for img in images]
         ev = self.make_event(
-            self.display_name(), summary=t("meteor.summary", sat=sat["name"], n=len(chosen), el=f"{p.max_elevation:.0f}"),
+            self.display_name(), summary=t("meteor.summary", sat=sat["name"], n=len(images), el=f"{p.max_elevation:.0f}"),
             body=(f"{t('meteor.satellite')}: {sat['name']}\n{t('meteor.frequency')}: {sat['freq_mhz']:.3f} MHz\n"
-                  f"{t('meteor.max_el')}: {p.max_elevation:.0f}°\n{t('meteor.images')}: {t('meteor.images_n', n=len(chosen))}"),
+                  f"{t('meteor.max_el')}: {p.max_elevation:.0f}°\n{t('meteor.images')}: {t('meteor.images_n', n=len(images))}"),
             freq_mhz=sat["freq_mhz"], priority=self.priority, attachments=atts,
+            duration_s=p.duration_s, time_utc=p.rise)
+        self.emit(ev)
+
+    def _report_no_image(self, sat, p, rc, *, tool_failed: bool) -> None:
+        self.log.info("Meteor pass produced no image (%s, rc=%s)", sat["name"], rc)
+        el = f"{p.max_elevation:.0f}"
+        body = t("meteor.tool_failed_body", rc=rc, el=el) if tool_failed else t("meteor.no_image_body", el=el)
+        ev = self.make_event(
+            self.display_name(), summary=t("meteor.no_image_summary", sat=sat["name"]),
+            body=body, freq_mhz=sat["freq_mhz"], priority=max(self.priority, 5),
             duration_s=p.duration_s, time_utc=p.rise)
         self.emit(ev)

@@ -178,3 +178,25 @@ def test_aging_lets_lower_priority_run():
     # ama p4 yeterince gecikmişse yine o kazanır
     p4.last_run = time.time() - 400           # oran 3.0 → skor 0.75
     assert sched._choose_action()[1].KEY == "airband"
+
+
+def test_pass_target_in_backoff_gives_dongle_to_cycle():
+    """A failed/finished pass must not keep the scheduler spinning on the pass target."""
+    now = time.time()
+
+    class PassT(FakeTarget):
+        def next_window(self, n):
+            return (now - 10, now + 300)
+
+    sat = PassT("meteor", Category.UYDU, cls="pass", prio=2, period=0)
+    other = FakeTarget("ism", Category.ISM, prio=5, period=0)
+    sched, st = _sched([sat, other])
+    a = sched._choose_action()
+    assert a[1].KEY == "meteor" and a[2] == "uydu"
+    sat.pass_retry_after = now + 60  # failed start → back-off: the normal cycle gets the dongle
+    a = sched._choose_action()
+    assert a[1].KEY == "ism"
+    sat.pass_retry_after = now + 301  # pass finished → nothing until the window ends
+    assert sched._choose_action()[1].KEY == "ism"
+    sat.pass_retry_after = 0
+    assert sched._choose_action()[1].KEY == "meteor"

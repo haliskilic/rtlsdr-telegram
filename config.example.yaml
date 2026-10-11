@@ -182,7 +182,7 @@ targets:
   gsm:
     enabled: true
     priority: 6
-    dwell_s: 180                    # the scan must finish within the dwell (results print at the end)
+    dwell_s: 300                    # the whole-band scan must finish within the dwell (~90 s idle, 2-3x under CPU load)
     period_s: 3600
     bands: [GSM900]                 # add DCS1800 with dwell_s: 420 or more
     speed: 27                       # grgsm_scanner --speed (0–29, higher = faster)
