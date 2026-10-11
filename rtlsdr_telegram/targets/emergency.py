@@ -1,16 +1,18 @@
-"""Hedef 7 — Acil durum vericileri: 406 MHz (EPIRB/ELT/PLB) ve 121.5 MHz.
+"""Target 7 — Distress beacons: 406 MHz (EPIRB/ELT/PLB) and 121.5 MHz.
 
-Yakalanınca ÖNCELİKLİ ALARM (kuyruğun önüne geçer, sesli bildirim).
+A detection raises a PRIORITY ALARM (jumps the queue, audible notification).
 
-Tam COSPAS-SARSAT 406 çözümü özel donanım/yazılım ister; burada güvenilir biçimde
-ENERJİ TESPİTİ yapılır:
-  - 406.0–406.1 MHz: rtl_power ile dar-bant tarama; taban gürültüsünün belirgin
-    üzerinde bir patlama ALARM üretir (406 vericileri ~0.5 sn / 50 sn yayınlar).
-  - 121.5 MHz: AM demodülasyon; sürekli yüksek seviye (ELT süpürme tonu) ALARM
-    üretir ve doğrulama için kısa ses kaydı alınır.
+Full COSPAS-SARSAT 406 decoding needs dedicated hardware/software; here a
+reliable ENERGY DETECTION is performed:
+  - 406.0–406.1 MHz: continuous narrow-band rtl_power sweep with per-bin max
+    hold; a burst clearly above the noise floor raises the alarm (406 beacons
+    transmit ~0.5 s every 50 s).
+  - 121.5 MHz: AM demodulation; a sustained strong level (ELT sweep tone)
+    raises the alarm and a short recording is attached for verification.
 
-Yanlış alarmı azaltmak için eşik yüksek tutulur ve tekrarlar belirli süre bastırılır.
-Not: Bu bantları yalnızca dinlemek yasaldır; 406 MHz'de yayın yapmak yasaktır.
+Thresholds are deliberately high to limit false alarms and repeats are
+suppressed for a while. Note: receiving these bands is legal; transmitting on
+406 MHz is not.
 """
 from __future__ import annotations
 
@@ -18,11 +20,13 @@ import threading
 import time
 
 from ..events import Category, Attachment, PRIO_EMERGENCY
+from ..i18n import t
 from .base import TargetBase, audio_attachment
 
 
 class EmergencyTarget(TargetBase):
-    NAME = "Acil Verici"
+    NAME_KEY = "emerg.name"
+    BAND_KEY = "emerg.band"
     CATEGORY = Category.ACIL
     CLASS = "opportunistic"
     DEFAULTS = {
@@ -32,12 +36,11 @@ class EmergencyTarget(TargetBase):
         "watch_406": True, "band_406": [406.0, 406.1], "threshold_406_db": 15.0,
         "watch_121_5": True, "freq_121_5_mhz": 121.5, "threshold_121_5_dbfs": -35.0,
         "sustain_s": 2.0, "record_121_5": True, "suppress_repeat_s": 300,
-        "band_label": "406 MHz / 121.5 MHz acil",
     }
 
     def tools_available(self):
         ok = self.sdr.bin_rtl_power is not None or self.sdr.bin_rtl_fm is not None
-        return ok, ("" if ok else "rtl_power/rtl_fm yok")
+        return ok, ("" if ok else "rtl_power/rtl_fm not found")
 
     def run_slot(self, stop_event: threading.Event, duration_s: float) -> None:
         tasks = []
@@ -47,16 +50,16 @@ class EmergencyTarget(TargetBase):
             tasks.append("121")
         if not tasks:
             return
-        # 406 MHz vericileri ~50 sn'de bir 0.5 sn yayın yapar; sürekli (one-shot değil)
-        # tarama ile yakalama olasılığı artar. Süre: dwell_406_s + dwell_121_s.
+        # 406 MHz beacons transmit 0.5 s every ~50 s; a continuous (not one-shot) sweep
+        # raises the catch probability. Duration: dwell_406_s + dwell_121_s.
         d406 = float(self.conf.get("dwell_406_s", 25))
         d121 = float(self.conf.get("dwell_121_s", 10))
         total = d406 + d121 if ("406" in tasks and "121" in tasks) else duration_s
         scale = min(1.0, duration_s / total) if total > 0 else 1.0
-        for t in tasks:
+        for task in tasks:
             if stop_event.is_set():
                 break
-            if t == "406":
+            if task == "406":
                 self._scan_406(stop_event, d406 * scale if "121" in tasks else duration_s)
             else:
                 self._watch_121_5(stop_event, d121 * scale if "406" in tasks else duration_s)
@@ -85,7 +88,7 @@ class EmergencyTarget(TargetBase):
                                        gain=self.conf.get("gain", 40), oneshot=False,
                                        log_path=self.cfg.log_dir / "emerg406.log")
         except Exception as e:
-            self.log_error(f"406 tarama kurulamadı: {e}")
+            self.log_error(f"406 MHz sweep could not be started: {e}")
             return
         proc.on_line = on_line
         deadline = time.time() + secs
@@ -101,7 +104,7 @@ class EmergencyTarget(TargetBase):
                 pass
         if not rows:
             return
-        # bin başına tepe tutma (max-hold): kısa patlamalar ortalamada kaybolmasın
+        # per-bin max-hold so short bursts are not averaged away
         peak_by_f: dict[float, float] = {}
         for f, v in rows:
             if v > peak_by_f.get(f, -999):
@@ -110,7 +113,7 @@ class EmergencyTarget(TargetBase):
         med = vals[len(vals) // 2]
         fpk, vpk = max(peak_by_f.items(), key=lambda x: x[1])
         if vpk - med >= thr:
-            self._alarm("406", round(fpk / 1e6, 4), f"+{vpk - med:.0f} dB taban üstü (tepe)", vpk)
+            self._alarm("406", round(fpk / 1e6, 4), t("common.above_floor_peak", db=f"{vpk - med:.0f}"), vpk)
 
     # ----------------------------------------------------------- 121.5 MHz
     def _watch_121_5(self, stop_event, secs):
@@ -127,7 +130,7 @@ class EmergencyTarget(TargetBase):
         try:
             proc.start()
         except Exception as e:
-            self.log_error(f"121.5 izleme başlatılamadı: {e}")
+            self.log_error(f"121.5 MHz watch could not be started: {e}")
             return
         bps = rate * 2
         above = 0.0
@@ -168,7 +171,7 @@ class EmergencyTarget(TargetBase):
                                             gain=self.conf.get("gain", 40), prefix="emerg121",
                                             require_dynamics=False)
             for s in segs:
-                atts.append(audio_attachment(s.final_path, caption="121.5 MHz kaydı"))
+                atts.append(audio_attachment(s.final_path, caption=t("emerg.caption_121")))
                 dur += s.duration_s
         self._alarm("121", round(freq_hz / 1e6, 4), f"{lvl:.1f} dBFS", lvl, attachments=atts, duration=dur)
 
@@ -182,16 +185,9 @@ class EmergencyTarget(TargetBase):
             return
         self.registry_touch("emerg_beacon", kind, {"freq": freq_mhz})
         if kind == "406":
-            etype = "ACİL 406 MHz"
-            label = "EPIRB/ELT/PLB acil durum vericisi (406 MHz)"
-            desc = ("406 MHz bandında güçlü patlama tespit edildi. Bu bant yalnızca EPIRB "
-                    "(gemi), ELT (uçak) ve PLB (kişisel) acil durum vericilerine ayrılmıştır. "
-                    "Gerçek bir acil durum olabilir — doğrulayın ve gerekirse yetkilileri arayın (AKUB/112).")
+            etype, label, desc = t("evt.emerg_406"), t("emerg.label_406"), t("emerg.desc_406")
         else:
-            etype = "ACİL 121.5 MHz"
-            label = "121.5 MHz acil/ELT tonu"
-            desc = ("121.5 MHz'de sürekli güçlü sinyal (ELT süpürme tonu olabilir) tespit edildi. "
-                    "Ekli kaydı dinleyerek doğrulayın.")
+            etype, label, desc = t("evt.emerg_121"), t("emerg.label_121"), t("emerg.desc_121")
         ev = self.make_event(
             etype, summary=f"⚠️ {label} — {freq_mhz:.3f} MHz",
             body=f"<b>{label}</b>\n{desc}", freq_mhz=freq_mhz,

@@ -1,14 +1,16 @@
-"""Telegram Bot API istemcisi (httpx ile doğrudan HTTP; ek bağımlılık gerektirmez).
+"""Telegram Bot API client (plain HTTP via httpx; no extra dependency).
 
 - send_message / send_voice / send_audio / send_photo / send_document
-- Uzun metni Telegram sınırında (4096) böler, medya başlığını (caption) 1024'te keser.
-- 429 (flood) ve geçici ağ hatalarında geri çekilme (backoff) ile yeniden dener.
-- get_updates ile komutları alır (uzun yoklama / long polling).
+- Splits long text at the Telegram limit (4096) and truncates captions at 1024.
+- Retries with backoff on 429 (flood) and transient network errors.
+- get_updates receives commands (long polling); leave_chat leaves foreign chats.
 
-Ağ kesilince gönderici hata döndürür; Dispatcher mesajı kuyrukta tutup sonra dener.
+When the network is down the sender raises; the Dispatcher keeps the message
+queued and retries later.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -46,11 +48,11 @@ class TelegramClient:
             pass
 
     def _san(self, text: Any) -> str:
-        """Hata metinlerinden bot token'ını temizler (log sızıntısını önler)."""
+        """Strip the bot token from error texts (prevents log leakage)."""
         t = str(text)
         return self._tok_re.sub("<TOKEN>", t) if self._tok_re else t
 
-    # ----------------------------------------------------------- düşük seviye
+    # ----------------------------------------------------------- low level
     def _call(self, method: str, *, data: dict | None = None, files: dict | None = None,
               timeout: float | None = None) -> dict:
         url = f"{self.base}/{method}"
@@ -59,18 +61,18 @@ class TelegramClient:
             r = self._client.post(url, data=payload, files=files,
                                   timeout=timeout or self._client.timeout)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.NetworkError) as e:
-            raise TelegramError(f"ağ hatası: {self._san(e)}", transient=True)
+            raise TelegramError(f"network error: {self._san(e)}", transient=True)
         except httpx.HTTPError as e:
-            raise TelegramError(f"http hatası: {self._san(e)}", transient=True)
+            raise TelegramError(f"http error: {self._san(e)}", transient=True)
         try:
             js = r.json()
         except ValueError:
             if r.status_code >= 500:
-                raise TelegramError(f"sunucu {r.status_code}", transient=True)
-            raise TelegramError(f"geçersiz yanıt ({r.status_code})")
+                raise TelegramError(f"server {r.status_code}", transient=True)
+            raise TelegramError(f"invalid response ({r.status_code})")
         if js.get("ok"):
             return js["result"]
-        desc = js.get("description", "bilinmeyen hata")
+        desc = js.get("description", "unknown error")
         params = js.get("parameters") or {}
         retry_after = float(params.get("retry_after", 0))
         code = js.get("error_code", 0)
@@ -87,26 +89,26 @@ class TelegramClient:
                 if not e.transient:
                     raise
                 wait = e.retry_after or min(2 ** i, 15)
-                self.log.debug("telegram %s yeniden denenecek (%.0fs): %s", method, wait, e)
-                if files:  # dosya akışını başa sar
+                self.log.debug("telegram %s will be retried (%.0fs): %s", method, wait, e)
+                if files:  # rewind file streams
                     for f in files.values():
                         try:
                             f[1].seek(0)
                         except (AttributeError, OSError):
                             pass
                 time.sleep(wait)
-        raise last or TelegramError("bilinmeyen")
+        raise last or TelegramError("unknown")
 
-    # --------------------------------------------------------------- yardımcı
+    # --------------------------------------------------------------- helpers
     @staticmethod
     def _split(text: str, limit: int = MSG_LIMIT) -> list[str]:
-        """Metni satır sınırlarında, her parça <= limit olacak şekilde böler."""
+        """Split text at line boundaries so every chunk is <= limit."""
         if len(text) <= limit:
             return [text]
         parts: list[str] = []
         cur = ""
         for line in text.split("\n"):
-            # tek satır bile limitten uzunsa önce biriktirileni boşalt, satırı dilimle
+            # a single over-long line: flush what we have, then slice the line
             while len(line) > limit:
                 if cur:
                     parts.append(cur)
@@ -150,7 +152,7 @@ class TelegramClient:
             try:
                 res = self._call_retry("sendMessage", data=data)
             except TelegramError as e:
-                # HTML ayrıştırma hatasında düz metne düş
+                # fall back to plain text on HTML parse errors
                 if "can't parse" in str(e).lower() or "parse" in str(e).lower():
                     data.pop("parse_mode", None)
                     data["text"] = self._strip_tags(chunk)
@@ -200,10 +202,19 @@ class TelegramClient:
     def send_document(self, chat_id, path, **kw) -> int:
         return self._send_file("sendDocument", "document", chat_id, str(path), **kw)
 
+    def leave_chat(self, chat_id) -> bool:
+        """Leave a chat the bot was added to (used to refuse foreign groups)."""
+        try:
+            self._call("leaveChat", data={"chat_id": chat_id}, timeout=20)
+            return True
+        except TelegramError as e:
+            self.log.debug("leaveChat failed: %s", e)
+            return False
+
     def get_updates(self, offset: int | None = None, timeout: int = 30,
                     allowed: list[str] | None = None) -> list[dict]:
         data = {"timeout": timeout, "offset": offset,
-                "allowed_updates": allowed or ["message", "channel_post"]}
+                "allowed_updates": json.dumps(allowed or ["message", "channel_post", "my_chat_member"])}
         try:
             return self._call("getUpdates", data=data, timeout=timeout + 15)
         except TelegramError as e:

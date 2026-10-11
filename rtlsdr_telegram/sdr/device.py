@@ -1,11 +1,11 @@
-"""Tek RTL-SDR dongle'ının paylaşımlı yönetimi.
+"""Shared management of the single RTL-SDR dongle.
 
-Aynı anda yalnızca tek bir süreç dongle'ı açabilir. Bu sınıf bir muteks ile
-dongle'ı "kiralar": bir hedef dongle'ı kullanırken başkası alamaz. Zamanlayıcı
-(scheduler) bu kiralamayı düzenler.
+Only one process can open the dongle at a time. This class "leases" it with a
+mutex: while one target uses the dongle nobody else can take it. The scheduler
+coordinates the leases.
 
-Ayrıca donanım bilgisi (rtl_test), rtl_power ile güç taraması ve rtl_fm ile ses
-demodülasyonu için yardımcılar sunar.
+It also provides hardware probing (rtl_test) and command builders for rtl_power
+sweeps, rtl_fm demodulation and raw IQ capture.
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class DeviceInfo:
 
 
 class DeviceLease:
-    """`with manager.lease(owner):` bloğu boyunca dongle'ı tutar."""
+    """Holds the dongle for the duration of a `with manager.lease(owner):` block."""
 
     def __init__(self, manager: "SdrManager", owner: str):
         self.manager = manager
@@ -48,7 +48,7 @@ class DeviceLease:
 
 
 class SdrManager:
-    """Dongle erişimini seri hale getiren yönetici."""
+    """Serializes access to the dongle."""
 
     def __init__(self, cfg, logger):
         self.cfg = cfg
@@ -67,29 +67,29 @@ class SdrManager:
         self.info: DeviceInfo | None = None
         self._probe_ts = 0.0
         self._probe_ttl = 30.0
-        # Ardışık açılışlar arasında libusb'nin aygıtı bırakması için asgari boşluk.
-        # Aksi halde bir sonraki araç "usb_claim_interface error -6" alır.
+        # Minimum gap between consecutive opens so libusb releases the device;
+        # otherwise the next tool fails with "usb_claim_interface error -6".
         self._last_release = 0.0
         self.release_gap_s = 1.0
-        # Harici araç yolları
+        # external tool paths
         self.bin_rtl_test = which("rtl_test")
         self.bin_rtl_fm = which("rtl_fm")
         self.bin_rtl_power = which("rtl_power")
         self.bin_rtl_sdr = which("rtl_sdr")
         self.bin_rtl_eeprom = which("rtl_eeprom")
 
-    # --------------------------------------------------------------- donanım
+    # --------------------------------------------------------------- hardware
     def probe(self, force: bool = False) -> DeviceInfo:
-        """rtl_test ile dongle'ı yoklar. Dongle kullanımdaysa 'meşgul' döndürür.
+        """Probe the dongle with rtl_test; reports 'busy' when another process holds it.
 
-        rtl_test kendiliğinden çıkmaz (sürekli örnekleme testi yapar); bu yüzden
-        çıktısını kısa süre okuyup süreci sonlandırırız. Sonuç kısa süre
-        önbelleğe alınır (scheduler her döngüde çağırır)."""
+        rtl_test never exits on its own (it keeps sampling), so we read its output
+        briefly and terminate it. The result is cached for a short time because
+        the scheduler asks on every loop."""
         now = time.time()
         if not force and self.info is not None and (now - self._probe_ts) < self._probe_ttl:
             return self.info
         if not self.bin_rtl_test:
-            self.info = DeviceInfo(False, detail="rtl_test bulunamadı (rtl-sdr kurulu değil)")
+            self.info = DeviceInfo(False, detail="rtl_test not found (rtl-sdr not installed)")
             self._probe_ts = now
             return self.info
         lines: list[str] = []
@@ -114,9 +114,9 @@ class SdrManager:
         m = re.search(r"Found (\d+) device", text)
         if not m or int(m.group(1)) == 0:
             if "usb_claim_interface error" in text or "Device or resource busy" in text or "usb_open error" in text:
-                self.info = DeviceInfo(True, detail="dongle meşgul (başka süreç kullanıyor olabilir)")
+                self.info = DeviceInfo(True, detail="dongle busy (another process may be using it)")
                 return self.info
-            self.info = DeviceInfo(False, detail="dongle bulunamadı")
+            self.info = DeviceInfo(False, detail="dongle not found")
             return self.info
         name = tuner = serial = ""
         for line in text.splitlines():
@@ -127,22 +127,22 @@ class SdrManager:
         if tm:
             tuner = tm.group(1).strip()
         self.info = DeviceInfo(True, self.device_index, name, tuner, serial,
-                               detail=f"{name or 'RTL-SDR'} / {tuner or 'bilinmeyen tuner'}")
+                               detail=f"{name or 'RTL-SDR'} / {tuner or 'unknown tuner'}")
         return self.info
 
     def device_present(self) -> bool:
-        # dongle o an kiralıysa (bir hedef kullanıyorsa) kesinlikle var
+        # if the dongle is currently leased by a target it is certainly present
         if self._owner is not None:
             return True
         info = self.probe()
         return info.present
 
     def note_device_ok(self) -> None:
-        """Bir hedef dongle'ı başarıyla kullandı — mevcut say, yoklamayı tazele."""
+        """A target used the dongle successfully — mark present and refresh the probe time."""
         self.info = DeviceInfo(True, self.device_index, detail=(self.info.detail if self.info else "RTL-SDR"))
         self._probe_ts = time.time()
 
-    # ----------------------------------------------------------- kiralama
+    # ----------------------------------------------------------- leasing
     def lease(self, owner: str) -> DeviceLease:
         return DeviceLease(self, owner)
 
@@ -159,7 +159,7 @@ class SdrManager:
                 elif self._owner == owner:
                     return
             if time.time() > deadline:
-                raise SdrError(f"dongle '{self._owner}' tarafından tutuluyor, '{owner}' alamadı")
+                raise SdrError(f"dongle is held by '{self._owner}', '{owner}' could not acquire it")
             time.sleep(0.1)
 
     def _release(self, owner: str) -> None:
@@ -170,12 +170,12 @@ class SdrManager:
                 self._last_release = time.time()
 
     def mark_released(self) -> None:
-        """Dongle kullanan bir alt süreç durduruldu — boşluk sayacını yenile."""
+        """A subprocess that used the dongle stopped — restart the release gap timer."""
         self._last_release = time.time()
 
     def wait_ready(self) -> None:
-        """Aynı slot içinde ardışık araçlar arasında (rtl_power → rtl_fm gibi) libusb'nin
-        aygıtı bırakması için asgari boşluğu bekler."""
+        """Wait for the minimum gap between consecutive tools in one slot (rtl_power -> rtl_fm)
+        so libusb has released the device."""
         gap = self.release_gap_s - (time.time() - self._last_release)
         if gap > 0:
             time.sleep(gap)
@@ -188,7 +188,7 @@ class SdrManager:
         with self._lock:
             self._owner = None
 
-    # ------------------------------------------------- argüman yardımcıları
+    # ------------------------------------------------- argument helpers
     def _dev_args(self, prefix_d: str = "-d") -> list[str]:
         return [prefix_d, str(self.device_index)]
 
@@ -205,9 +205,9 @@ class SdrManager:
     # ---------------------------------------------------------- rtl_power
     def power_scan(self, start_hz: int, end_hz: int, bin_hz: int, *, integration: str = "1",
                    gain=None, oneshot: bool = True, crop: int = 0, log_path=None) -> ManagedProcess:
-        """rtl_power sürecini başlatır (CSV stdout). Çağıran satırları ayrıştırır."""
+        """Build the rtl_power process (CSV on stdout); the caller parses the lines."""
         if not self.bin_rtl_power:
-            raise SdrError("rtl_power bulunamadı")
+            raise SdrError("rtl_power not found")
         self.wait_ready()
         cmd = [self.bin_rtl_power, "-f", f"{start_hz}:{end_hz}:{bin_hz}", "-i", str(integration),
                "-p", str(self.ppm)] + self.gain_args(gain)
@@ -222,9 +222,9 @@ class SdrManager:
     def rtl_fm_cmd(self, freq_hz: int, *, mode: str = "fm", sample_rate: int = 24000,
                    resample: int | None = None, gain=None, squelch: int = 0,
                    extra: list[str] | None = None) -> list[str]:
-        """rtl_fm komut satırını kurar (ham s16le PCM stdout verir)."""
+        """Build the rtl_fm command line (raw s16le PCM on stdout)."""
         if not self.bin_rtl_fm:
-            raise SdrError("rtl_fm bulunamadı")
+            raise SdrError("rtl_fm not found")
         cmd = [self.bin_rtl_fm, "-M", mode, "-f", str(freq_hz), "-s", str(sample_rate),
                "-p", str(self.ppm), "-l", str(squelch)] + self.gain_args(gain) + self._dev_args()
         if resample:
@@ -235,9 +235,9 @@ class SdrManager:
         return cmd
 
     def iq_cmd(self, freq_hz: int, sample_rate: int, *, gain=None, num_samples: int | None = None) -> list[str]:
-        """rtl_sdr ile ham IQ (u8) yakalama komutu — stdout'a."""
+        """rtl_sdr raw IQ (u8) capture command — to stdout."""
         if not self.bin_rtl_sdr:
-            raise SdrError("rtl_sdr bulunamadı")
+            raise SdrError("rtl_sdr not found")
         cmd = [self.bin_rtl_sdr, "-f", str(freq_hz), "-s", str(sample_rate), "-p", str(self.ppm)]
         cmd += self.gain_args(gain)
         if num_samples:

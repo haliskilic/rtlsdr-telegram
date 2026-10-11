@@ -1,9 +1,9 @@
-"""Uydu/ISS geçiş hesabı için TLE yönetimi ve skyfield tabanlı tahmin.
+"""TLE management and skyfield-based pass prediction for satellites/ISS.
 
-TLE verisi Celestrak'tan indirilir ve yerelde önbelleğe alınır (yapılandırılabilir
-tazelik). Her uydu için verilen istasyon konumundan görünür geçişler (yükseliş,
-doruk, batış ve en yüksek irtifa) hesaplanır. Zamanlayıcı bu pencereleri kullanıp
-geçiş anında ilgili frekansa öncelik verir (madde 8).
+TLE data is downloaded from several sources (with fallback) and cached locally.
+For every satellite the visible passes from the station (rise, culmination,
+set, max elevation) are computed. The scheduler uses these windows to give the
+satellite frequency priority during a pass (spec section 8).
 """
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ class SatellitePredictor:
         return self.cache_dir / f"{norad}.tle"
 
     def _tle_sources(self) -> list[str]:
-        """Denenecek TLE kaynak URL'leri (sırayla). {norad} yer tutucusu kullanılır."""
+        """TLE source URLs to try in order; {norad} is substituted."""
         urls = self.sat_cfg.get("tle_urls")
         if isinstance(urls, list) and urls:
             return urls
@@ -77,7 +77,7 @@ class SatellitePredictor:
 
     @staticmethod
     def _parse_tle_response(text: str) -> tuple[str, str] | None:
-        """Hem düz TLE metnini hem JSON (line1/line2) biçimini ayrıştırır."""
+        """Parse both plain TLE text and JSON (line1/line2) responses."""
         text = text.strip()
         if text.startswith("{"):
             try:
@@ -96,17 +96,17 @@ class SatellitePredictor:
         return None
 
     def get_tle(self, norad: int, name: str = "") -> tuple[str, str] | None:
-        """NORAD kimliği için (satır1, satır2) TLE döndürür; indirir/önbellekler.
+        """Return the (line1, line2) TLE for a NORAD id; downloads and caches it.
 
-        Birden çok kaynak sırayla denenir. Tüm kaynaklar başarısızsa, bir süre
-        (tle_retry_min) yeniden denenmez; varsa eski önbellek yine kullanılır."""
+        Several sources are tried in order. When all fail, no retry happens for
+        `tle_retry_min`; a stale cache is still used if present."""
         path = self._tle_path(norad)
         max_age = float(self.sat_cfg.get("tle_max_age_h", 24)) * 3600
         if path.exists() and (time.time() - path.stat().st_mtime) < max_age:
             cached = self._read_tle(path)
             if cached:
                 return cached
-        # başarısızlık geri çekilmesi: son denemeden bu yana yeterli süre geçmediyse indirme
+        # failure backoff: do not download again until enough time has passed
         retry_s = float(self.sat_cfg.get("tle_retry_min", 30)) * 60
         last_fail = self._tle_fail.get(norad, 0)
         if time.time() - last_fail < retry_s:
@@ -131,11 +131,11 @@ class SatellitePredictor:
                     self._tle_fail.pop(norad, None)
                     return tle
             except Exception as e:
-                self.log.debug("TLE kaynağı başarısız (%s, NORAD %s): %s", url.split('/')[2] if '//' in url else url, norad, e)
+                self.log.debug("TLE source failed (%s, NORAD %s): %s", url.split('/')[2] if '//' in url else url, norad, e)
                 continue
-        # tüm kaynaklar başarısız
+        # all sources failed
         self._tle_fail[norad] = time.time()
-        self.log.warning("TLE indirilemedi (NORAD %s) — tüm kaynaklar başarısız, %s dk sonra tekrar denenecek",
+        self.log.warning("TLE download failed (NORAD %s) — all sources failed, retrying in %s min",
                          norad, self.sat_cfg.get("tle_retry_min", 30))
         return self._read_tle(path) if path.exists() else None
 
@@ -148,10 +148,10 @@ class SatellitePredictor:
         return None
 
     def _satellite(self, norad: int, name: str) -> "EarthSatellite | None":
-        """EarthSatellite nesnesini döndürür; TLE eskidiyse (tle_max_age_h) yeniler.
+        """Return the EarthSatellite object; refresh it when the TLE is older than tle_max_age_h.
 
-        Önceki sürümde nesne süresiz önbelleğe alınıyordu → uzun süre çalışan
-        süreçte TLE hiç tazelenmiyor, geçiş tahminleri günler içinde kayıyordu."""
+        An earlier version cached the object forever, so a long-running process
+        never refreshed its TLE and pass predictions drifted within days."""
         if not HAVE_SKYFIELD:
             return None
         max_age = float(self.sat_cfg.get("tle_max_age_h", 24)) * 3600
@@ -160,7 +160,7 @@ class SatellitePredictor:
             return cached
         tle = self.get_tle(norad, name)
         if not tle:
-            return cached  # yenilenemedi; eldeki (eski) nesneyle devam
+            return cached  # refresh failed; keep the existing (stale) object
         sat = EarthSatellite(tle[0], tle[1], name, self._ts)
         self._sats[norad] = sat
         self._sat_loaded[norad] = time.time()
@@ -170,7 +170,7 @@ class SatellitePredictor:
         self._sats.pop(norad, None)
         self._satellite(norad, name)
 
-    # --------------------------------------------------------------- geçişler
+    # --------------------------------------------------------------- passes
     def passes(self, norad: int, name: str, *, hours: float = 24, min_elev: float = 15.0) -> list[Pass]:
         sat = self._satellite(norad, name)
         if sat is None:
@@ -180,7 +180,7 @@ class SatellitePredictor:
         try:
             times, events = sat.find_events(self._topos, t0, t1, altitude_degrees=min_elev)
         except Exception as e:
-            self.log.warning("geçiş hesabı hatası (%s): %s", name, e)
+            self.log.warning("pass computation error (%s): %s", name, e)
             return []
         out: list[Pass] = []
         rise = culm = None
@@ -193,7 +193,7 @@ class SatellitePredictor:
                 max_el = 0.0
             elif ev == 1:
                 if rise is None:
-                    rise = now_dt  # geçiş zaten sürüyor (başlangıçta pencere içindeyiz)
+                    rise = now_dt  # the pass is already in progress at startup
                 culm = dt
                 try:
                     alt, _, _ = (sat - self._topos).at(t).altaz()
@@ -202,7 +202,7 @@ class SatellitePredictor:
                     max_el = min_elev
             elif ev == 2:
                 if rise is None:
-                    rise = now_dt  # yalnız batış görüldü: sürmekte olan geçişin sonu
+                    rise = now_dt  # only the set event seen: tail of an ongoing pass
                     if max_el == 0.0:
                         max_el = min_elev
                 out.append(Pass(name, rise, culm or rise, dt, max_el))
@@ -219,7 +219,7 @@ class SatellitePredictor:
 
 
     def upcoming(self, sats: list[dict], *, hours: float = 24, limit: int = 8) -> list[Pass]:
-        """Birden çok uydu için yaklaşan geçişleri zaman sırasıyla döndürür.
+        """Upcoming passes for several satellites in time order.
 
         sats: [{"norad": int, "name": str, "min_elevation": float}, ...]"""
         allp: list[Pass] = []

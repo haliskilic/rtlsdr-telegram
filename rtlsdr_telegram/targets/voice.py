@@ -1,17 +1,19 @@
-"""Hedef 9–12 — Ses kaydı üreten bantlar (eşik tetiklemeli).
+"""Targets 9–12 — Voice bands with threshold-triggered recording.
 
-Ortak taban (VoiceTargetBase): yapılandırılmış kanal listesini dwell süresi
-boyunca dönüşümlü dinler; her kanalda AudioRecorder ile VOX (ses varlığı)
-tetiklemeli kayıt yapar. Yayın bitince (sessizlik) segment kapanır, ogg/opus'a
-çevrilir, olay olarak gönderilir ve otomatik yazıya dökülür (madde 4).
+Common base (VoiceTargetBase): at the start of each slot the configured
+`scan_ranges` are swept with rtl_power and active channels are prioritized;
+the fixed `channels` list is always kept. Each channel is listened to with the
+AudioRecorder VOX logic: a segment opens when the level crosses the threshold
+and closes after silence; it is encoded to ogg/opus, sent as an event and
+transcribed automatically (spec section 4).
 
-  9. AmateurVoiceTarget — 144–146 ve 430–440 MHz (röle/simpleks), FM, squelch.
- 10. AirbandTarget       — 118–137 MHz, AM (kule/yaklaşma/ATIS).
- 11. MarineVoiceTarget    — 156–162 MHz, FM (özellikle Kanal 16 156.800).
- 12. CBPMRTarget          — 26–28 MHz ve 446 MHz, FM.
+  9. AmateurVoiceTarget — 144–146 and 430–440 MHz (repeaters/simplex), FM.
+ 10. AirbandTarget      — 118–137 MHz, AM (tower/approach/ATIS).
+ 11. MarineVoiceTarget  — 156–162 MHz, FM (channel 16 prioritized).
+ 12. CBPMRTarget        — 26–28 MHz and 446 MHz, FM.
 
-rtl_fm'i doğrudan kullanır (hafif, güvenilir); demodülasyon + squelch bizim
-AudioRecorder VOX mantığımızla yapılır, böylece kayıt sınırları net olur.
+rtl_fm is used directly (light, reliable); squelch/VOX is our own so recording
+boundaries are clean. Flat-level segments (FM static) are rejected.
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from datetime import timezone
 
 from ..events import Category, Attachment, PRIO_IMPORTANT, PRIO_NORMAL
 from ..channel_maps import channel_name, describe
+from ..i18n import t
 from .base import TargetBase, audio_attachment
 
 
@@ -30,13 +33,13 @@ class VoiceTargetBase(TargetBase):
 
     def tools_available(self):
         if not self.sdr.bin_rtl_fm:
-            return False, "rtl_fm yok"
+            return False, "rtl_fm not found"
         if not self.cfg.which(self.cfg.get("audio.ffmpeg", "ffmpeg")):
-            return True, "(ffmpeg yok — WAV olarak gönderilecek)"
+            return True, "(ffmpeg missing — WAV will be sent as a document)"
         return True, ""
 
     def channels(self) -> list[dict]:
-        """[{freq_mhz, name?}] listesi döndürür (config.channels)."""
+        """Return [{freq_mhz, name?}] from config.channels."""
         chans = self.conf.get("channels", [])
         out = []
         for c in chans:
@@ -50,9 +53,9 @@ class VoiceTargetBase(TargetBase):
         if not self.check_tools():
             return
         end = time.time() + duration_s
-        # 1) Bant taraması (şartname: 144–146 / 430–440 / 118–137 / 156–162 MHz).
-        #    rtl_power ile hızlı süpürme; taban gürültüsünün üstündeki aktif kanallar
-        #    öne alınır. Sabit kanal listesi (channels) her zaman korunur.
+        # 1) Band sweep (spec: 144–146 / 430–440 / 118–137 / 156–162 MHz) with
+        #    rtl_power; channels above the noise floor are prioritized. The fixed
+        #    channel list is always kept.
         active = []
         ranges = self.conf.get("scan_ranges") or []
         if ranges and self.sdr.bin_rtl_power and not stop_event.is_set():
@@ -67,7 +70,7 @@ class VoiceTargetBase(TargetBase):
             seen.add(k)
             chans.append(c)
         if not chans:
-            self.log.debug("%s: dinlenecek kanal yok", self.KEY)
+            self.log.debug("%s: no channels to listen to", self.KEY)
             return
         remain_total = max(1.0, end - time.time())
         per = max(float(self.conf.get("min_channel_s", 8)), remain_total / len(chans))
@@ -81,7 +84,7 @@ class VoiceTargetBase(TargetBase):
             self._listen_channel(c, min(per, remain), stop_event)
 
     def _scan_active(self, ranges, stop_event, budget_s: float) -> list[dict]:
-        """rtl_power ile verilen aralıkları süpürüp aktif kanalları döndürür."""
+        """Sweep the given ranges with rtl_power and return active channels."""
         thr = float(self.conf.get("scan_threshold_db", 10.0))
         max_ch = int(self.conf.get("scan_max_channels", 3))
         found: list[tuple[float, float]] = []
@@ -111,7 +114,7 @@ class VoiceTargetBase(TargetBase):
                                            gain=self.conf.get("gain", "auto"), oneshot=True,
                                            log_path=self.cfg.log_dir / f"{self.KEY}_scan.log")
             except Exception as e:
-                self.log.debug("bant taraması kurulamadı: %s", e)
+                self.log.debug("band sweep could not be started: %s", e)
                 continue
             proc.on_line = on_line
             t0 = time.time()
@@ -144,11 +147,11 @@ class VoiceTargetBase(TargetBase):
                 continue
             used.append(key)
             out.append({"freq_mhz": key,
-                        "name": channel_name(key, self.MAP_HINT) or f"taramada aktif (+{snr:.0f} dB)"})
+                        "name": channel_name(key, self.MAP_HINT) or t("voice.scan_active", db=f"{snr:.0f}")})
             if len(out) >= max_ch:
                 break
         if out:
-            self.log.info("%s bant taraması: aktif %s", self.KEY,
+            self.log.info("%s band sweep: active %s", self.KEY,
                           ", ".join(f"{c['freq_mhz']:.3f}" for c in out))
         return out
 
@@ -177,16 +180,16 @@ class VoiceTargetBase(TargetBase):
                                        f"{seg.peak_dbfs:.1f} dBFS", None)
         is_priority = self._is_priority(freq_mhz, cname)
         att = audio_attachment(seg.final_path, caption=band)
-        body = [f"Kanal      : {cname or '—'}",
-                f"Tepe seviye: {seg.peak_dbfs:.1f} dBFS  (ort. {seg.mean_dbfs:.1f})"]
+        body = [f"{t('voice.channel')}: {cname or '—'}",
+                f"{t('voice.peak')}: {seg.peak_dbfs:.1f} dBFS  ({t('voice.avg')} {seg.mean_dbfs:.1f})"]
         ev = self.make_event(
-            self.EVENT_TYPE, summary=f"{band} — {seg.duration_s:.0f} sn yayın",
+            self.display_name(), summary=t("voice.summary", band=band, s=f"{seg.duration_s:.0f}"),
             body="\n".join(body), freq_mhz=freq_mhz, band=band,
-            signal=f"{seg.peak_dbfs:.1f} dBFS (tepe)", signal_value=seg.peak_dbfs,
+            signal=t("common.peak_dbfs", v=f"{seg.peak_dbfs:.1f}"), signal_value=seg.peak_dbfs,
             duration_s=seg.duration_s, attachments=[att],
             priority=PRIO_IMPORTANT if is_priority else self.priority,
             time_utc=seg.start_utc)
-        # transkripsiyon iste
+        # request transcription
         ev.transcript_status = "pending"
         ev.transcription_language = self.conf.get("transcribe_language")
         ev.extra["recording_id"] = rec_id
@@ -195,22 +198,18 @@ class VoiceTargetBase(TargetBase):
     def _is_priority(self, freq_mhz, cname) -> bool:
         return False
 
-    EVENT_TYPE = "Ses Yayını"
-
 
 class AmateurVoiceTarget(VoiceTargetBase):
-    NAME = "Amatör Telsiz Ses"
-    EVENT_TYPE = "Amatör Telsiz Ses"
+    NAME_KEY = "voice.amateur.name"
+    BAND_KEY = "voice.amateur.band"
     CATEGORY = Category.AMATOR
     MODE = "fm"
     MAP_HINT = "amateur"
     DEFAULTS = {
         "enabled": True, "priority": 5, "dwell_s": 90, "period_s": 300,
         "channels": [
-            {"freq_mhz": 145.500, "name": "2m çağrı simpleks"},
-            {"freq_mhz": 145.675, "name": "Röle çıkışı"},
-            {"freq_mhz": 433.500, "name": "70cm çağrı simpleks"},
-            {"freq_mhz": 439.000, "name": "Röle çıkışı"},
+            {"freq_mhz": 145.500},
+            {"freq_mhz": 433.500},
         ],
         "scan_ranges": [
             {"start_mhz": 144.0, "end_mhz": 146.0, "step_khz": 12.5},
@@ -218,26 +217,25 @@ class AmateurVoiceTarget(VoiceTargetBase):
         ],
         "scan_threshold_db": 10.0, "scan_max_channels": 3,
         "threshold_dbfs": -42.0, "hangover_s": 1.5, "gain": "auto",
-        "band_label": "144–146 / 430–440 MHz amatör", "transcribe_language": "tr",
+        "transcribe_language": None,
     }
 
 
 class AirbandTarget(VoiceTargetBase):
-    NAME = "Hava Bandı Ses"
-    EVENT_TYPE = "Hava Bandı Ses"
+    NAME_KEY = "voice.airband.name"
+    BAND_KEY = "voice.airband.band"
     CATEGORY = Category.HAVACILIK
     MODE = "am"
     MAP_HINT = "air"
     DEFAULTS = {
         "enabled": True, "priority": 4, "dwell_s": 90, "period_s": 300,
         "channels": [
-            {"freq_mhz": 118.100, "name": "Kule (örnek)"},
-            {"freq_mhz": 121.500, "name": "Acil (Guard)"},
+            {"freq_mhz": 121.500},
         ],
         "scan_ranges": [{"start_mhz": 118.0, "end_mhz": 137.0, "step_khz": 25}],
         "scan_threshold_db": 10.0, "scan_max_channels": 3,
         "threshold_dbfs": -38.0, "hangover_s": 1.2, "gain": 40,
-        "band_label": "118–137 MHz hava bandı (AM)", "transcribe_language": "en",
+        "transcribe_language": "en",
     }
 
     def _is_priority(self, freq_mhz, cname) -> bool:
@@ -245,22 +243,22 @@ class AirbandTarget(VoiceTargetBase):
 
 
 class MarineVoiceTarget(VoiceTargetBase):
-    NAME = "Deniz VHF Ses"
-    EVENT_TYPE = "Deniz VHF Ses"
+    NAME_KEY = "voice.marine.name"
+    BAND_KEY = "voice.marine.band"
     CATEGORY = Category.DENIZCILIK
     MODE = "fm"
     MAP_HINT = "marine"
     DEFAULTS = {
         "enabled": True, "priority": 4, "dwell_s": 90, "period_s": 300,
         "channels": [
-            {"freq_mhz": 156.800, "name": "Kanal 16 (Acil/Çağrı)"},
-            {"freq_mhz": 156.650, "name": "Kanal 13 (Köprü-köprü)"},
-            {"freq_mhz": 156.600, "name": "Kanal 12 (Liman/VTS)"},
+            {"freq_mhz": 156.800},
+            {"freq_mhz": 156.650},
+            {"freq_mhz": 156.600},
         ],
         "scan_ranges": [{"start_mhz": 156.0, "end_mhz": 162.05, "step_khz": 25}],
         "scan_threshold_db": 10.0, "scan_max_channels": 3,
         "threshold_dbfs": -40.0, "hangover_s": 1.5, "gain": "auto",
-        "band_label": "156–162 MHz deniz VHF", "transcribe_language": "tr",
+        "transcribe_language": None,
     }
 
     def _is_priority(self, freq_mhz, cname) -> bool:
@@ -268,18 +266,18 @@ class MarineVoiceTarget(VoiceTargetBase):
 
 
 class CBPMRTarget(VoiceTargetBase):
-    NAME = "CB / PMR446 Ses"
-    EVENT_TYPE = "CB/PMR446 Ses"
+    NAME_KEY = "voice.cbpmr.name"
+    BAND_KEY = "voice.cbpmr.band"
     CATEGORY = Category.AMATOR
     MODE = "fm"
     MAP_HINT = None
     DEFAULTS = {
         "enabled": True, "priority": 6, "dwell_s": 60, "period_s": 360,
         "channels": [
-            {"freq_mhz": 27.185, "name": "CB Kanal 19 (Karayolu)"},
-            {"freq_mhz": 27.065, "name": "CB Kanal 9 (Acil)"},
-            {"freq_mhz": 446.00625, "name": "PMR Kanal 1"},
-            {"freq_mhz": 446.09375, "name": "PMR Kanal 8"},
+            {"freq_mhz": 27.185},
+            {"freq_mhz": 27.065},
+            {"freq_mhz": 446.00625},
+            {"freq_mhz": 446.09375},
         ],
         "scan_ranges": [
             {"start_mhz": 26.96, "end_mhz": 27.41, "step_khz": 10},
@@ -287,11 +285,11 @@ class CBPMRTarget(VoiceTargetBase):
         ],
         "scan_threshold_db": 10.0, "scan_max_channels": 2,
         "threshold_dbfs": -42.0, "hangover_s": 1.5, "gain": "auto",
-        "band_label": "26–28 MHz CB / 446 MHz PMR", "transcribe_language": "tr",
+        "transcribe_language": None,
     }
 
     def _listen_channel(self, chan, secs, stop_event):
-        # CB/PMR karışık; kanal adını her iki tablodan çöz
+        # CB and PMR are mixed; resolve the channel name from the matching table
         hint = "cb" if chan["freq_mhz"] < 30 else "pmr"
         self.MAP_HINT = hint
         super()._listen_channel(chan, secs, stop_event)

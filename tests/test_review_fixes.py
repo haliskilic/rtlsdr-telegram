@@ -39,7 +39,7 @@ def test_slot_collector_individual_then_summary():
         c.add(f"öge {i}", Event(f"E{i}", Category.ISM), sort_key=i)
     assert c.flush() == 1 and len(t.d.sent) == 1  # çok öge → tek özet
     body = t.d.sent[0].body
-    assert "öge 6" in body and "ve 4 öge daha" in body  # en yüksek sort önce, kalan sayısı
+    assert "öge 6" in body and "4 more" in body  # highest sort first, remaining count
 
 
 def test_audio_attachment_kinds():

@@ -1,9 +1,9 @@
-"""Yapılandırma yükleme ve doğrulama.
+"""Configuration loading and validation.
 
-Tüm ayarlar tek bir YAML dosyasından (config.yaml) okunur. Burada tanımlı
-DEFAULTS sözlüğü eksik anahtarlar için varsayılan değerleri sağlar; her hedef
-modülü kendi varsayılanlarını `DEFAULTS` sınıf niteliğiyle ekler ve
-`Config.target(key)` çağrısı bu ikisini birleştirir.
+All settings come from a single YAML file (config.yaml). The DEFAULTS dict
+below supplies values for missing keys; every target module adds its own
+defaults through its `DEFAULTS` class attribute and `Config.target(key)`
+merges the two.
 """
 from __future__ import annotations
 
@@ -17,17 +17,26 @@ from typing import Any
 
 import yaml
 
-# Program genelinde geçerli varsayılanlar. config.example.yaml dosyası bu
-# yapının açıklamalı halidir.
+# Program-wide defaults. config.example.yaml is the annotated version of this structure.
 DEFAULTS: dict[str, Any] = {
     "platform": "auto",            # auto | linux | raspberrypi | windows
+    "language": "en",              # UI/Telegram message language: en | tr
     "timezone": "Europe/Istanbul",
-    "station": {"name": "RTL-SDR İstasyonu", "lat": 41.0082, "lon": 28.9784, "alt_m": 50},
+    "station": {"name": "RTL-SDR Station", "lat": 41.0082, "lon": 28.9784, "alt_m": 50},
     "paths": {
         "data_dir": "./data",
         "recordings_dir": "./data/recordings",
         "log_dir": "./logs",
-        "retention_days": 14,
+        # Circular retention: oldest recordings/events/logs are deleted after this
+        # period so the disk never fills up. months/years override retention_days.
+        "retention_days": 30,
+        "retention_months": 0,
+        "retention_years": 0,
+        "registry_retention_multiplier": 3,   # device/aircraft/ship memory lives 3x longer
+        "tool_log_max_mb": 5,                 # per-tool log (adsb.log ...) rotation size
+        "tool_log_backups": 2,
+        "min_free_disk_pct": 10,              # below this: stop recording, prune oldest files, warn once/day
+        "db_vacuum_days": 30,                 # SQLite VACUUM interval
         "log_level": "INFO",
     },
     "telegram": {
@@ -85,14 +94,9 @@ DEFAULTS: dict[str, Any] = {
         "vad": True,
         "beam_size": 1,
         "api": {"base_url": "https://api.openai.com/v1", "api_key": "", "model": "whisper-1"},
-        "prompts": {
-            "Havacılık": "Tower, approach, runway, cleared for takeoff, cleared to land, QNH, squawk, "
-                         "flight level, heading, descend, climb, ATIS, kule, pist, iniş, kalkış.",
-            "Denizcilik": "Kanal 16, Mayday, Pan Pan, Securite, Sahil Güvenlik, liman, gemi, kaptan, "
-                          "demir, rota, knot, channel sixteen, coast guard, vessel.",
-            "Amatör Telsiz": "QSO, QTH, QSL, 73, röle, çağrı işareti, TA1, TA2, YM, CQ, roger, over.",
-            "Acil Durum": "Mayday, Pan Pan, emergency, 121.5, acil, yardım.",
-        },
+        # Vocabulary hints per category key (aviation, maritime, amateur, emergency ...).
+        # Empty = use the built-in bilingual hints from i18n.
+        "prompts": {},
     },
     "audio": {
         "format": "ogg",              # ogg | mp3 | wav
@@ -103,13 +107,13 @@ DEFAULTS: dict[str, Any] = {
     },
     "summary": {"enabled": True, "time": "09:00", "attach_csv": True, "top_n": 5},
     "satellites": {
-        # Sırayla denenecek kaynaklar ({norad} yer tutucusu). İlk çalışan kullanılır.
+        # Sources tried in order ({norad} placeholder); the first that works is used.
         "tle_urls": [
             "https://tle.ivanstanojevic.me/api/tle/{norad}",
             "https://celestrak.org/NORAD/elements/gp.php?CATNR={norad}&FORMAT=tle",
         ],
         "tle_max_age_h": 24,
-        "tle_retry_min": 30,     # tüm kaynaklar başarısızsa bu kadar dk sonra tekrar dene
+        "tle_retry_min": 30,     # when all sources fail, retry after this many minutes
         "lookahead_h": 24,
         "refresh_min": 60,
     },
@@ -118,11 +122,11 @@ DEFAULTS: dict[str, Any] = {
 
 
 class ConfigError(Exception):
-    """Yapılandırma dosyası hatalı/eksik olduğunda fırlatılır."""
+    """Raised when the configuration file is invalid or missing."""
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
-    """İki sözlüğü özyinelemeli birleştirir (override kazanır)."""
+    """Recursively merge two dicts (override wins)."""
     out = copy.deepcopy(base)
     for k, v in (override or {}).items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -133,7 +137,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def detect_platform(requested: str = "auto") -> str:
-    """'windows' | 'raspberrypi' | 'linux' döndürür."""
+    """Return 'windows' | 'raspberrypi' | 'linux'."""
     req = (requested or "auto").lower()
     if req != "auto":
         return req
@@ -151,7 +155,7 @@ def detect_platform(requested: str = "auto") -> str:
 
 
 class Config:
-    """Birleştirilmiş yapılandırmaya erişim sarmalayıcısı."""
+    """Accessor wrapper around the merged configuration."""
 
     def __init__(self, data: dict, path: Path | None = None):
         self.data = data
@@ -160,7 +164,7 @@ class Config:
         self.platform = detect_platform(data.get("platform", "auto"))
         self._target_defaults: dict[str, dict] = {}
 
-    # ----- genel erişim -----
+    # ----- generic access -----
     def get(self, dotted: str, default: Any = None) -> Any:
         node: Any = self.data
         for part in dotted.split("."):
@@ -172,12 +176,12 @@ class Config:
     def section(self, name: str) -> dict:
         return self.data.get(name, {}) or {}
 
-    # ----- hedef yapılandırması -----
+    # ----- target configuration -----
     def register_target_defaults(self, key: str, defaults: dict) -> None:
         self._target_defaults[key] = copy.deepcopy(defaults)
 
     def target(self, key: str) -> dict:
-        """Hedefin varsayılanlarıyla birleştirilmiş yapılandırmasını döndürür."""
+        """Return the target configuration merged with its defaults."""
         base = self._target_defaults.get(key, {})
         user = (self.data.get("targets") or {}).get(key) or {}
         return _deep_merge(base, user)
@@ -185,7 +189,7 @@ class Config:
     def target_keys(self) -> list[str]:
         return list((self.data.get("targets") or {}).keys())
 
-    # ----- yollar -----
+    # ----- paths -----
     def resolve(self, p: str | Path) -> Path:
         path = Path(os.path.expanduser(str(p)))
         return path if path.is_absolute() else (self.base_dir / path).resolve()
@@ -202,13 +206,22 @@ class Config:
     def log_dir(self) -> Path:
         return self.resolve(self.get("paths.log_dir", "./logs"))
 
+    def retention_days(self) -> int:
+        """Effective retention in days (years/months take precedence over days)."""
+        p = self.section("paths")
+        years = float(p.get("retention_years", 0) or 0)
+        months = float(p.get("retention_months", 0) or 0)
+        if years > 0 or months > 0:
+            return max(1, int(round(years * 365 + months * 30.44)))
+        return max(1, int(p.get("retention_days", 30) or 30))
+
     def ensure_dirs(self) -> None:
         for d in (self.data_dir, self.recordings_dir, self.log_dir, self.data_dir / "tmp"):
             d.mkdir(parents=True, exist_ok=True)
 
-    # ----- yardımcılar -----
+    # ----- helpers -----
     def which(self, *names: str) -> str | None:
-        """Verilen adlardan PATH'te bulunan ilk çalıştırılabiliri döndürür."""
+        """Return the first executable found on PATH among the given names."""
         for n in names:
             if not n:
                 continue
@@ -221,7 +234,7 @@ class Config:
             if not found and self.platform == "windows" and not n.lower().endswith(".exe"):
                 found = shutil.which(n + ".exe")
             if not found:
-                # PATH eksik olabilir (ör. systemd/pct exec); standart dizinleri de tara
+                # PATH may be incomplete (systemd / pct exec); also scan standard directories
                 for d in ("/usr/local/bin", "/usr/bin", "/bin", "/usr/local/sbin", "/usr/sbin"):
                     cand = Path(d) / n
                     if cand.exists() and os.access(cand, os.X_OK):
@@ -244,25 +257,25 @@ class Config:
         return any(lo <= freq_mhz <= hi for lo, hi, _ in self.blacklist_ranges())
 
     def validate(self) -> list[str]:
-        """Kritik hataları döndürür (boş liste = sorun yok)."""
+        """Return critical problems (empty list = fine)."""
         problems = []
         tg = self.section("telegram")
         if not tg.get("token"):
-            problems.append("telegram.token boş")
+            problems.append("telegram.token is empty")
         if not tg.get("chat_id"):
-            problems.append("telegram.chat_id boş (grup kimliği, -100... ile başlar)")
+            problems.append("telegram.chat_id is empty (group id, starts with -100...)")
         st = self.section("station")
         try:
             lat, lon = float(st.get("lat")), float(st.get("lon"))
             if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-                problems.append("station.lat/lon aralık dışı")
+                problems.append("station.lat/lon out of range")
         except (TypeError, ValueError):
-            problems.append("station.lat/lon sayısal değil")
+            problems.append("station.lat/lon is not numeric")
         return problems
 
 
 def load_config(path: str | Path | None = None) -> Config:
-    """YAML dosyasını okuyup varsayılanlarla birleştirir."""
+    """Read the YAML file and merge it with the defaults."""
     candidates = [path] if path else ["config.yaml", "config.yml", "/etc/rtlsdr-telegram/config.yaml"]
     for cand in candidates:
         if cand and Path(cand).exists():
@@ -270,12 +283,12 @@ def load_config(path: str | Path | None = None) -> Config:
             with open(p, "r", encoding="utf-8") as fh:
                 user = yaml.safe_load(fh) or {}
             if not isinstance(user, dict):
-                raise ConfigError(f"{p}: üst düzey bir sözlük bekleniyor")
-            # Kara liste kullanıcı tarafından verilmişse varsayılanın yerine geçer
+                raise ConfigError(f"{p}: a top-level mapping is expected")
+            # a user-supplied blacklist replaces the default one
             merged = _deep_merge(DEFAULTS, user)
             if "blacklist" in user:
                 merged["blacklist"] = user["blacklist"] or []
             return Config(merged, p)
     if path:
-        raise ConfigError(f"Yapılandırma dosyası bulunamadı: {path}")
+        raise ConfigError(f"Configuration file not found: {path}")
     return Config(copy.deepcopy(DEFAULTS), None)

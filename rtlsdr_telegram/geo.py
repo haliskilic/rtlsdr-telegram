@@ -1,13 +1,13 @@
-"""Coğrafi yardımcılar: mesafe, kerteriz, konum biçimlendirme."""
+"""Geographic helpers: distance, bearing, location formatting."""
 from __future__ import annotations
 
 import math
 
-_COMPASS_TR = ["K", "KD", "D", "GD", "G", "GB", "B", "KB"]
+from .i18n import compass_labels
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """İki koordinat arasındaki büyük daire mesafesi (km)."""
+    """Great-circle distance between two coordinates (km)."""
     r = 6371.0088
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = p2 - p1
@@ -17,7 +17,7 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """1. noktadan 2. noktaya kerteriz (0-360, kuzeyden saat yönünde)."""
+    """Bearing from point 1 to point 2 (0–360, clockwise from north)."""
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dl = math.radians(lon2 - lon1)
     x = math.sin(dl) * math.cos(p2)
@@ -25,21 +25,26 @@ def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
 
 
-def compass_tr(deg: float) -> str:
-    """Dereceyi 8 yönlü Türkçe pusula kısaltmasına çevirir."""
-    return _COMPASS_TR[int((deg + 22.5) // 45) % 8]
+def compass(deg: float) -> str:
+    """8-point compass abbreviation in the active language."""
+    labels = compass_labels()
+    return labels[int((deg + 22.5) // 45) % 8]
+
+
+# Backwards-compatible alias used by older call sites.
+compass_tr = compass
 
 
 def format_location(lat: float | None, lon: float | None, station_lat: float | None = None,
                     station_lon: float | None = None) -> str:
-    """Başlıktaki 'Konum' alanı için metin üretir."""
+    """Text for the header 'Location' field."""
     if lat is None or lon is None:
         return "—"
     txt = f"{lat:.4f}, {lon:.4f}"
     if station_lat is not None and station_lon is not None:
         d = haversine_km(station_lat, station_lon, lat, lon)
         b = bearing_deg(station_lat, station_lon, lat, lon)
-        txt += f" ({d:.1f} km {compass_tr(b)})"
+        txt += f" ({d:.1f} km {compass(b)})"
     return txt
 
 

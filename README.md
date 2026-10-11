@@ -1,300 +1,320 @@
 # rtlsdr-telegram
 
-Tek bir **RTL2832U / R860 (R820T2)** dongle ile çevreyi sürekli tarayan, FM radyo
-ve TV yayınlarını yok sayan, yakaladığı olayları bir **Telegram grubunun tek bir
-topic'ine** zengin başlıklarla gönderen; uygun bantlarda **ses kaydı** alıp bu
-kayıtları **otomatik yazıya döken** modüler bir izleme sistemi.
+**Multi-band radio monitoring with a single RTL-SDR dongle, delivered to one Telegram topic.**
+Aircraft, ships, weather balloons, wireless sensors, amateur packet radio, distress beacons,
+GSM cell inventory, voice bands (recorded **and transcribed**), Meteor-M satellite images,
+ISS passes and a learning spectrum watchdog — 16 targets scheduled fairly on one RTL2832U.
 
-> **Yasal not:** Bu yazılım yalnızca **dinleme/alma** yapar; hiçbir bantta yayın
-> yapmaz. Bazı yayınların dinlenmesi ve özellikle içeriğinin kaydı/üçüncü kişilerle
-> paylaşımı ülkenize göre yasal kısıtlamalara tabidir. GSM hedefi **yalnızca baz
-> istasyonu kimlik envanteri** yapar (Cell ID/LAC/MCC/MNC); hücresel **içerik çözmez**.
-> Acil durum bantlarını (406/121.5 MHz) yalnızca dinler. Sorumluluk kullanıcıdadır.
+> 🇹🇷 Türkçe README: [README.tr.md](README.tr.md) · Kurulum: [docs/INSTALL.tr.md](docs/INSTALL.tr.md)
 
----
+[![License](https://img.shields.io/badge/license-source--available-blue)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.11%2B-informational)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Raspberry%20Pi%20%7C%20Proxmox%20LXC%20%7C%20Windows-success)
 
-## İçindekiler
-- [Mimari](#mimari)
-- [İzlenen 16 hedef](#izlenen-16-hedef)
-- [Mesaj formatı](#mesaj-formatı)
-- [Kurulum](#kurulum)
-- [Yapılandırma](#yapılandırma)
-- [Telegram komutları](#telegram-komutları)
-- [Özellikler: transkripsiyon, günlük özet](#özellikler)
-- [Tek dongle zamanlama mantığı](#tek-dongle-zamanlama-mantığı)
-- [Sorun giderme](#sorun-giderme)
+- [What it does](#what-it-does)
+- [Sample messages](#sample-messages)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Telegram commands](#telegram-commands)
+- [Security model](#security-model)
+- [Architecture](#architecture)
+- [The 16 targets and the tools behind them](#the-16-targets-and-the-tools-behind-them)
+- [Scheduling on one dongle](#scheduling-on-one-dongle)
+- [Retention and disk safety](#retention-and-disk-safety)
+- [Troubleshooting](#troubleshooting)
+- [License, donations, legal](#license-donations-legal)
 
----
+## What it does
 
-## Mimari
+| | |
+|---|---|
+| 📡 **One dongle, 16 targets** | A fair scheduler time-slices the RTL-SDR between ADS-B, AIS, ACARS/VDL2, radiosondes, ISM sensors, APRS, 406/121.5 MHz distress beacons, GSM cell IDs, four voice bands, Meteor-M, ISS, Inmarsat and a spectrum sweep. FM radio and TV bands are blacklisted. |
+| 💬 **One Telegram topic** | Every event lands in a single topic with a structured header (band, exact frequency, local+UTC time, duration, signal, location, summary) and a category emoji. Emergencies jump the queue and ring. |
+| 🎙️ **Record + transcribe** | Voice bands are recorded on squelch/VOX, encoded to Opus and transcribed locally with faster-whisper (Turkish, English, auto-detect). Audio and text arrive together. |
+| 🛰️ **Satellite passes** | Meteor-M LRPT images via SatDump and ISS voice/SSTV/packet, scheduled from TLE data. |
+| 🔭 **Spectrum watchdog** | Learns the normal noise floor of 24–1766 MHz and reports new strong signals with a waterfall image. |
+| 🧰 **Operations** | Daily summary with CSV, `/status`, `/scan`, `/mute`, `/priority` commands, persistent offline queue, circular retention, disk guard, log rotation, systemd service. English by default, Turkish built in. |
 
-```
-                    ┌─────────────────────────────────────────────┐
-                    │                 Application                 │
-                    │  (config, logging, yaşam döngüsü, bakım)    │
-                    └───────────────┬─────────────────────────────┘
-                                    │
-   ┌────────────┬──────────────────┼───────────────┬───────────────┐
-   │            │                  │               │               │
-┌──▼───┐   ┌────▼─────┐      ┌──────▼──────┐   ┌─────▼─────┐   ┌─────▼──────┐
-│ SDR  │   │Scheduler │      │ 16 x Target │   │Dispatcher │   │ Commands   │
-│ Mgr  │◄──┤ (tek     │─────►│  (her hedef │──►│ (kuyruk → │   │ (/durum,   │
-│(lease│   │  dongle  │ lease│  ayrı sınıf)│   │ Telegram) │   │  /tara...) │
-│ +probe)   │  slot)   │      └──────┬──────┘   └─────┬─────┘   └────────────┘
-└──┬───┘   └──────────┘             │ Event          │
-   │ rtl_fm/rtl_power/rtl_sdr       │          ┌─────▼──────┐
-   │                                │          │ Telegram   │
-┌──▼──────────┐              ┌──────▼───────┐  │  Client    │
-│ Harici      │              │Transcription │  └────────────┘
-│ araçlar     │              │  Worker      │
-│ (readsb,    │              │(faster-      │  ┌────────────┐
-│ rtl_433,    │              │ whisper)     │  │ Storage    │
-│ AIS-catcher,│              └──────────────┘  │ (SQLite:   │
-│ acarsdec,   │                                │ olaylar,   │
-│ dumpvdl2,   │   ┌─────────────┐              │ kuyruk,    │
-│ grgsm,      │   │ Satellite   │              │ cihaz      │
-│ SatDump,    │   │ Predictor   │              │ defteri,   │
-│ multimon-ng)│   │ (skyfield   │              │ kayıtlar)  │
-└─────────────┘   │  + TLE)     │              └────────────┘
-                  └─────────────┘
-```
+## Sample messages
 
-**İlkeler**
-- Her hedef ayrı bir modül/sınıftır (`rtlsdr_telegram/targets/`), ortak
-  `Event` veri modelini üretir.
-- Harici çözücüler **alt süreç** olarak çağrılır; çıktıları (JSON/CSV/satır)
-  ayrıştırılır. Araç seçimleri aşağıda gerekçeleriyle listelenmiştir.
-- **Sağlamlık:** bir hedef çökerse diğerleri etkilenmez; zamanlayıcı bir sonrakine
-  geçer, hata loglanır (`logs/errors.log`). Ağ kesilince mesajlar SQLite kuyrukta
-  tutulur, bağlantı gelince gönderilir.
-- **Tek dongle** bir muteks (lease) ile paylaşılır; zamanlayıcı kime ne kadar
-  süre vereceğine öncelik kurallarıyla karar verir. Ardışık açılışlar arasında
-  ~1 sn boşluk bırakılır (libusb aygıtı bırakmadan "usb_claim" hatası alınmasın).
-- Hedef sınıfları: `waiting` (frekansta süre ayıran ADS-B/AIS/ACARS/radyosonda —
-  normal döngüde uzun dwell), `opportunistic` (fırsatçı), `pass` (yalnız TLE
-  penceresinde: Meteor-M, ISS).
+Rendered exactly as the bot formats them (English; the Turkish layout is identical).
 
-### Neden bu araçlar?
-| Hedef | Araç | Gerekçe |
-|------|------|---------|
-| ADS-B | **readsb** | dump1090 uyumlu JSON, düşük CPU, Debian deposunda |
-| ACARS | **acarsdec** | yerleşik JSON çıktısı (`-o 4`), çoklu frekans |
-| VDL2 | **dumpvdl2** | `decoded:json` çıktısı, RTL desteği |
-| AIS | **AIS-catcher** | tek dongle ile iki kanal, yüksek yakalama, JSON |
-| ISM | **rtl_433** | yüzlerce protokol (hava ist., TPMS, kapı zili), JSON |
-| APRS | **multimon-ng** | hafif, borudan AFSK1200; aprslib ile ayrıştırma |
-| GSM | **gr-gsm** (grgsm_scanner) | hücre kimliği taraması, içerik çözmeden |
-| Meteor-M | **SatDump** | LRPT ardışık düzeni, otomatik ürün görüntüsü |
-| Radyosonda | **radiosonde_auto_rx** | telemetri (opsiyonel) + yerleşik taşıyıcı tespiti |
-| Ses bantları | **rtl_fm** + kendi VOX'umuz | net kayıt sınırları, format bağımsız |
-| Spektrum | **rtl_power** | SoapySDR gerektirmez, CSV güç taraması |
-| Transkripsiyon | **faster-whisper** | CPU'da hızlı, Türkçe+İngilizce, yerel |
-
----
-
-## İzlenen 16 hedef
-
-**Metin bildirimi üretenler**
-1. **ADS-B uçak** (1090 MHz) — çağrı kodu, konum, irtifa, hız; alçak uçuş;
-   acil squawk 7500/7600/7700 → öncelikli alarm.
-2. **ACARS/VDL2** (~131 / 136.7–137 MHz) — uçak veri mesajları, kuyruk no, sefer, metin.
-3. **AIS gemi** (161.975/162.025 MHz) — gemi adı, MMSI, tip, rota/hız, "yeni gemi".
-4. **Radyosonda** (400–406 MHz) — taşıyıcı tespiti; auto_rx ile kalkış/irtifa/
-   patlama/tahmini düşüş.
-5. **ISM sensörler** (433.92/868 MHz) — hava istasyonu, sıcaklık/nem, kapı zili,
-   TPMS; "yeni cihaz görüldü".
-6. **APRS** (144.800 MHz) — konum ve kısa mesajlar.
-7. **Acil durum vericileri** (406 / 121.5 MHz) — **ÖNCELİKLİ ALARM**, 121.5'te kayıt.
-8. **GSM envanteri** (900/1800) — yalnız Cell ID/LAC/MCC/MNC; yeni/değişen hücre.
-
-**Ses kaydı üretenler** (eşik aşılınca kaydeder, yayın bitince kapatır → yazıya döker)
-9. **Amatör telsiz** (144–146 / 430–440 MHz, FM).
-10. **Hava bandı** (118–137 MHz, AM) — kule/yaklaşma/ATIS.
-11. **Deniz VHF** (156–162 MHz, FM) — özellikle **Kanal 16**.
-12. **CB / PMR446** (26–28 / 446 MHz, FM).
-
-**Uydu / görüntü**
-13. **Meteor-M** (LRPT, 137 MHz) — her geçişte görüntü (SatDump).
-14. **ISS** (145.800/145.825 MHz) — geçişte ses, SSTV, veri paketi.
-15. **Inmarsat** (~1.5 GHz STD-C/AERO) — **ek L-bant anten+LNA gerektirir**;
-    aktif/pasif seçeneği, donanım yoksa otomatik atlar.
-
-**Genel gözcü**
-16. **Spektrum taraması** (24–1766 MHz, FM/TV hariç) — taban profili öğrenir;
-    yeni/güçlü sinyalde frekans, süre, güç ve **şelale görüntüsü** gönderir.
-
----
-
-## Mesaj formatı
-
-Tüm olaylar **aynı topic'e** gider; ayırt etme başlıktaki yapılandırılmış alanlarla
-ve kategori emojisiyle yapılır:
+### ADS-B — slot summary
 
 ```
-✈️ ADS-B Uçak • Havacılık
-├ Frekans aralığı : 1090 MHz ADS-B
-├ Yakalanan frekans: 1090.000 MHz
-├ Zaman           : 2026-10-11 17:45:12 (+03:00) / 14:45:12 UTC
-├ Süre            : —
-├ Sinyal gücü     : -18.3 dBFS
-├ Konum           : 41.1234, 29.0456 (12.4 km KD)
-└ Özet            : Yeni uçak THY1KA — 12 km
+✈️ ADS-B Summary • Aviation
+├ Band      : 1090 MHz ADS-B
+├ Frequency : 1090.000 MHz
+├ Time      : 2026-10-11 17:32:05 (+03:00) / 14:32:05 UTC
+├ Duration  : 1 min 30 s
+├ Signal    : -9.4 dBFS
+├ Location  : —
+└ Summary   : 23 aircraft seen (4 new), nearest 6.8 km
 
-ICAO adresi: 4BA9C1
-Çağrı kodu : THY1KA
-İrtifa     : 11800 ft
-Yer hızı   : 420 kt
-...
+Total 23 aircraft (4 new), 19 with position
+Listening time: 90 s
+
+• THY1KA    38000 ft   6.8 km NE  🆕
+• PGT4R     12300 ft  11.2 km E
+• SXS88H     3100 ft  14.9 km SE
+… and 16 more aircraft
 ```
 
-Ses olaylarında ses dosyası (.ogg) ve transkripsiyon aynı mesaj dizisinde gelir.
-Uydu olaylarında .png görüntüler eklenir. Acil olaylar kuyruğun önüne geçer ve
-sesli bildirim olarak gider.
+### ADS-B — nearby low aircraft
 
-Kategoriler: Havacılık ✈️, Denizcilik 🚢, Uydu 🛰️, Meteoroloji 🎈, Amatör Telsiz 📻,
-ISM/Sensör 📡, Acil Durum 🚨, Hücresel 📶, Genel Tarama 🔭.
+```
+✈️ ADS-B Aircraft • Aviation
+├ Band      : 1090 MHz ADS-B
+├ Frequency : 1090.000 MHz
+├ Time      : 2026-10-11 17:32:05 (+03:00) / 14:32:05 UTC
+├ Duration  : —
+├ Signal    : -11.2 dBFS
+├ Location  : 40.9600, 29.3500 (7.1 km NE)
+└ Summary   : Nearby aircraft THY1KA — 6.8 km
 
----
+ICAO address: 4BA9C1
+Callsign: THY1KA
+Altitude: 2900 ft  ⚠️ low altitude
+Ground speed: 182 kt
+Heading: 54° (NE)
+Squawk: 4521
+```
 
-## Kurulum
+### Marine VHF — voice recording + transcript (audio file attached as a reply)
 
-### Proxmox LXC (bu depo bununla kuruldu)
-Ayrıntılar için [`docs/PROXMOX.md`](docs/PROXMOX.md). Özet: ayrıcalıksız (unprivileged)
-bir Debian 13 LXC oluşturulur, USB geçişi (cgroup `c 189:*` + `/dev/bus/usb` bind)
-verilir, host'ta DVB sürücüsü kara listeye alınır.
+```
+🚢 Marine VHF Voice • Maritime
+├ Band      : 156.800 MHz · Channel 16 (Distress/Calling)
+├ Frequency : 156.800 MHz
+├ Time      : 2026-10-11 17:32:05 (+03:00) / 14:32:05 UTC
+├ Duration  : 14 s
+├ Signal    : -18.3 dBFS (peak)
+├ Location  : —
+└ Summary   : Coast station, coast station, this is motor vessel Blue Marmara, switching to channel six.
 
-### Linux PC / LXC
+Channel: Channel 16 (Distress/Calling)
+Peak level: -18.3 dBFS  (avg -24.1)
+
+📝 Transcript (en):
+Coast station, coast station, this is motor vessel Blue Marmara, switching to channel six.
+```
+
+### Emergency — 406 MHz distress beacon (priority alarm)
+
+```
+🚨 EMERGENCY 406 MHz • Emergency
+├ Band      : 406 MHz / 121.5 MHz emergency
+├ Frequency : 406.028 MHz
+├ Time      : 2026-10-11 17:32:05 (+03:00) / 14:32:05 UTC
+├ Duration  : —
+├ Signal    : +21 dB above floor (peak)
+├ Location  : —
+└ Summary   : ⚠️ EPIRB/ELT/PLB distress beacon (406 MHz) — 406.028 MHz
+
+EPIRB/ELT/PLB distress beacon (406 MHz)
+A strong burst was detected in the 406 MHz band, which is reserved exclusively for EPIRB (ship), ELT (aircraft) and PLB (personal) distress beacons. This may be a real emergency — verify and contact the authorities if appropriate.
+```
+
+### Spectrum — new signal (waterfall image attached)
+
+```
+🔭 Spectrum Anomaly • General Scan
+├ Band      : 240–440 MHz sweep
+├ Frequency : 433.075 MHz
+├ Time      : 2026-10-11 17:32:05 (+03:00) / 14:32:05 UTC
+├ Duration  : —
+├ Signal    : +18 dB above floor
+├ Location  : —
+└ Summary   : New signal @ 433.075 MHz (+18 dB)
+
+Peak frequency: 433.075 MHz
+Bandwidth: ~75 kHz
+Power: -12.4 dB (+18 dB)
+Noise floor: -30.6 dB
+```
+
+### Meteor-M — LRPT pass (images attached)
+
+```
+🛰️ Meteor-M Image • Satellite
+├ Band      : 137 MHz Meteor-M LRPT
+├ Frequency : 137.100 MHz
+├ Time      : 2026-10-11 17:32:05 (+03:00) / 14:32:05 UTC
+├ Duration  : 12 min 22 s
+├ Signal    : —
+├ Location  : —
+└ Summary   : METEOR-M2 4 pass — 3 images (max 69°)
+
+Satellite: METEOR-M2 4
+Frequency: 137.100 MHz
+Max elevation: 69°
+Images: 3 files
+```
+
+### ISM — new devices (one summary per slot)
+
+```
+📡 ISM New Devices • ISM/Sensors
+├ Band      : 433.92 / 868 MHz ISM
+├ Frequency : —
+├ Time      : 2026-10-11 17:32:05 (+03:00) / 14:32:05 UTC
+├ Duration  : —
+├ Signal    : —
+├ Location  : —
+└ Summary   : New devices: 5 items
+
+11 distinct devices heard in this slot.
+
+• Weather station: Bresser-5in1 #112 (21.3 °C)
+• Tire sensor (TPMS): Schrader #a3f1c2 (231 kPa)
+• Temperature/Humidity sensor: Nexus-TH #45 (18.9 °C)
+• Doorbell/Remote: Honeywell-ActivLink #7f3a
+• Device: Generic-Remote #0e11
+```
+
+A daily summary (event counts per category, unique aircraft/vessels/sensors, top events,
+recorded audio time, images, new devices, uptime, errors) is posted every morning with a CSV export.
+
+## Installation
+
+Full step-by-step guides for every platform (for beginners): **[docs/INSTALL.md](docs/INSTALL.md)**
+— Ubuntu/Debian · Raspberry Pi · Proxmox LXC (USB passthrough) · Windows.
+
+Short version (Linux):
 ```bash
-sudo bash install/debian-linux.sh
-sudo nano /opt/rtlsdr-telegram/config.yaml   # token, chat_id, admins
+git clone https://github.com/haliskilic/rtlsdr-telegram.git && cd rtlsdr-telegram
+sudo bash install/debian-linux.sh                 # packages, source builds, venv, systemd unit
+python3 tools/telegram_ids.py <BOT_TOKEN>         # find chat_id / thread_id / your user id
+sudo nano /opt/rtlsdr-telegram/config.yaml        # token, chat_id, thread_id, admins, lat/lon
 /opt/rtlsdr-telegram/venv/bin/python /opt/rtlsdr-telegram/run.py --check -c /opt/rtlsdr-telegram/config.yaml
 sudo systemctl enable --now rtlsdr-telegram
-journalctl -u rtlsdr-telegram -f
+```
+See also [QUICKSTART.md](QUICKSTART.md).
+
+## Configuration
+
+One file: `config.yaml` (annotated examples: [config.example.yaml](config.example.yaml),
+Turkish [config.example.tr.yaml](config.example.tr.yaml)). Everything is configurable without
+touching code: language, Telegram token/group/topic/admins, per-target enable/frequencies/
+dwell/period/thresholds/priority, transcription engine and language, daily summary time,
+blacklist, station location, retention. Minimal `config.yaml`:
+
+```yaml
+language: en
+telegram:
+  token: "123456789:AAF..."
+  chat_id: -1001234567890
+  thread_id: 123
+  admins: [987654321]
+station: {name: "My Station", lat: 41.0082, lon: 28.9784}
 ```
 
-### Raspberry Pi
-```bash
-sudo bash install/raspberrypi.sh
-```
-Pi'de `transcription.model: tiny` ve daha uzun `spectrum.period_s` önerilir.
+## Telegram commands
 
-### Windows
-[`install/windows.md`](install/windows.md) adımlarını izleyin (Zadig sürücüsü +
-hazır ikili araçlar + venv).
+Both English and Turkish command names work regardless of the message language.
+Only configured admins are served.
 
----
+| Command | Turkish alias | Description |
+|---------|---------------|-------------|
+| `/status` | `/durum` | active targets, current band, CPU/temperature, uptime, next satellite pass |
+| `/list` | `/liste` | all targets with state and tool availability |
+| `/scan 145.500 [s] [am\|fm]` | `/tara` | listen to a frequency now; recordings + transcript are posted |
+| `/mute <category>` | `/sustur` | mute a category (emergencies always pass) |
+| `/unmute <category>` | `/ac` | unmute |
+| `/priority <target>` | `/oncelik` | move a target to the front of the cycle |
+| `/summary` | `/ozet` | daily summary now |
+| `/recordings [n]` | `/kayitlar` | resend the last n recordings |
+| `/passes [hours]` | `/gecisler` | upcoming Meteor-M / ISS passes |
+| `/help` | `/yardim` | command list |
 
-## Yapılandırma
+## Security model
 
-Tek dosya: `config.yaml` (örnek: `config.example.yaml`). Koddan ayrı olarak
-ayarlanabilenler: Telegram token/grup/topic/yöneticiler; her hedef için
-aktif/pasif, frekans, dinleme süresi, eşik/squelch, öncelik; transkripsiyon
-motoru ve dili; günlük özet saati; kara liste (FM/TV dahil); istasyon konumu
-(uydu hesapları için); platform.
+- The bot **only posts to the configured chat/topic**.
+- Commands are accepted **only from user ids in `telegram.admins`**, and only inside the
+  configured group (or in a private chat from an admin). An empty admin list refuses everyone.
+- Commands from any other group are ignored; **if the bot is added to a foreign group it leaves
+  automatically**; strangers who message it privately get **no reply**.
+- The token lives only in `config.yaml` (`chmod 600`), never in logs or the repository
+  (errors are scrubbed). Recommended: in BotFather set `/setjoingroups` → Disable.
+- These rules are covered by unit tests (`tests/test_security.py`).
 
-Kontrol komutları:
-```bash
-python run.py --check -c config.yaml           # yapılandırma + araç + dongle durumu
-python run.py --test-telegram -c config.yaml   # Telegram bağlantı testi
-python tools/telegram_ids.py <BOT_TOKEN>       # grup/topic/yönetici kimliklerini bul
-```
-
-### Sel (flood) koruması
-Yoğun ortamlarda (havalimanı yakını, Marmara gemi trafiği, şehir içi ISM) her
-tespit için ayrı mesaj topic'i boğar. Varsayılanlar buna göre ayarlıdır:
-- **ADS-B / AIS:** `report_mode: summary` — slot sonunda tek özet (en yakınlar
-  listesiyle). Yalnız acil squawk, AIS-SART ve `report_nearby_km` içindeki
-  yeni/alçak hedefler ayrı mesaj alır. `each` kipi her yeni hedefi bildirir.
-- **ISM:** yeni cihazlar slot başına `individual_max` adede kadar ayrı, fazlası tek özet.
-- **ACARS/VDL2:** slot başına `max_events_per_slot`, fazlası özet.
-- **Spektrum / radyosonda taşıyıcı:** aynı sinyal `repeat_min` dolmadan tekrar bildirilmez.
-
-### Ses bantlarında bant taraması
-Ses hedefleri slot başında `scan_ranges` aralıklarını rtl_power ile süpürür,
-taban gürültüsünün `scan_threshold_db` üstündeki kanalları öne alıp dinler;
-sabit `channels` listesi her zaman korunur. FM statiği (düz seviyeli ses)
-`require_dynamics` kapısıyla reddedilir; sürekli tonlar (121.5 ELT, ISS SSTV,
-`/tara`) bu kapıdan muaftır.
-
----
-
-## Telegram komutları
-
-Yalnızca `telegram.admins` listesindeki kullanıcılar çalıştırabilir.
-
-| Komut | Açıklama |
-|-------|----------|
-| `/durum` | aktif hedefler, dinlenen bant, CPU/sıcaklık, uptime |
-| `/liste` | tüm hedefler ve durumları |
-| `/tara 145.500 [sn] [am\|fm]` | frekansı geçici dinle |
-| `/sustur <kategori>` | kategoriyi geçici sustur |
-| `/ac <kategori>` | kategoriyi geri aç |
-| `/oncelik <hedef>` | hedefi tarama döngüsünde öne al |
-| `/ozet` | günlük özeti hemen üret |
-| `/kayitlar <n>` | son n ses kaydını yeniden gönder |
-| `/gecisler [saat]` | yaklaşan Meteor-M / ISS geçişleri |
-| `/yardim` | komut listesi |
-
----
-
-## Özellikler
-
-### A) Otomatik transkripsiyon
-Her ses kaydı kapandıktan sonra otomatik yazıya dökülür. Motor seçilebilir
-(`faster_whisper` varsayılan, `whisper`, `api`, `none`). Dil otomatik algılanır
-(`auto`) veya hedefe göre zorlanır (havacılık için `en`, deniz/amatör için `tr`).
-Transkripsiyon, dongle'ı meşgul etmeden ayrı iş parçacığında yapılır ve ilgili
-ses dosyasıyla aynı mesaj dizisine eklenir. Başarısızsa "ses alındı, metin
-çıkarılamadı" notuyla ham kayıt yine gönderilir.
-
-### B) Günlük özet
-Her gün `summary.time` saatinde: kategori sayıları, en aktif türler, benzersiz
-uçak/gemi/sensör, en dikkat çeken 5 olay, toplam ses süresi, görüntü sayısı,
-yeni cihaz/hücre/anomali, uptime ve hata özeti. İsteğe bağlı CSV eki.
-
----
-
-## Tek dongle zamanlama mantığı
-
-Hedefler iki sınıftır: **bekleme gerektirenler** (uydu/ISS geçişleri — TLE'den
-hesaplanan pencerede önceliklidir) ve **fırsatçı taranlar** (ses bantları, ISM,
-spektrum, ADS-B...). Çakışmada öncelik:
+## Architecture
 
 ```
-Acil Durum  >  zamanlanmış uydu geçişi  >  kullanıcı /oncelik  >  normal döngü
+            ┌───────────────────────────────────────────────┐
+            │  Application (config, logging, lifecycle)      │
+            └──────────────┬────────────────────────────────┘
+   ┌──────────┬────────────┼──────────────┬────────────────┐
+┌──▼───┐  ┌───▼──────┐  ┌───▼─────────┐ ┌──▼────────┐ ┌─────▼──────┐
+│ SDR  │  │Scheduler │  │ 16 Targets  │ │Dispatcher │ │ Commands   │
+│lease │◄─┤fair time-├─►│ (one class  ├─►│ queue →   │ │ (admins    │
+│probe │  │ slicing  │  │  each)      │ │ Telegram  │ │  only)     │
+└──┬───┘  └──────────┘  └──┬──────┬───┘ └─────┬─────┘ └────────────┘
+   │ rtl_fm / rtl_power     │      │           │
+┌──▼──────────────┐   ┌─────▼──┐ ┌─▼─────────┐ ┌─▼──────────────────┐
+│ external tools  │   │Transcr.│ │Satellite  │ │ SQLite: events,    │
+│ readsb rtl_433  │   │worker  │ │predictor  │ │ persistent queue,  │
+│ AIS-catcher ... │   │whisper │ │(TLE)      │ │ registry, records  │
+└─────────────────┘   └────────┘ └───────────┘ └────────────────────┘
 ```
+Every target is a module in `rtlsdr_telegram/targets/`, produces a common `Event`, runs
+external decoders as subprocesses and parses their output. A crashing target never affects
+the others; the dispatcher keeps unsent messages in SQLite until Telegram is reachable.
 
-Her hedefe `dwell_s` (dinleme süresi) ve `period_s` (periyot) atanır. Döngü durumu
-`/durum` ile görünür: "şu an X dinleniyor, sıradaki Y". Dongle yoksa döngü bekler
-ve bunu bildirir; dongle takılınca otomatik devam eder.
+## The 16 targets and the tools behind them
 
----
+| # | Target | Band | Tool | Output |
+|---|--------|------|------|--------|
+| 1 | Aircraft ADS-B | 1090 MHz | readsb | per-slot summary, nearby/low alerts, squawk 7500/7600/7700 alarm |
+| 2 | ACARS / VDL2 | 131 / 136.9 MHz | acarsdec, dumpvdl2 | text messages |
+| 3 | Vessels AIS | 161.975/162.025 MHz | AIS-catcher | per-slot summary, nearby alerts, AIS-SART alarm |
+| 4 | Radiosondes | 400–406 MHz | rtl_power (+ radiosonde_auto_rx) | carrier candidates; launch/burst/landing with auto_rx |
+| 5 | ISM sensors | 433.92 / 868 MHz | rtl_433 | new devices (batched) |
+| 6 | APRS | 144.800 MHz | multimon-ng | positions, messages |
+| 7 | Distress beacons | 406 / 121.5 MHz | rtl_power / rtl_fm | **priority alarm**, 121.5 recording |
+| 8 | GSM inventory | 900/1800 MHz | gr-gsm | cell IDs only (no content) |
+| 9–12 | Voice: amateur, airband, marine, CB/PMR | 144/430, 118–137, 156–162, 27/446 MHz | rtl_fm + VOX | recordings + transcripts |
+| 13 | Meteor-M | 137 MHz LRPT | SatDump | images per pass |
+| 14 | ISS | 145.800/145.825 MHz | rtl_fm / multimon-ng | voice, SSTV, packets |
+| 15 | Inmarsat STD-C/AERO | ~1.5 GHz | SatDump / JAERO | text (needs L-band antenna + LNA; off by default) |
+| 16 | Spectrum watchdog | 24–1766 MHz | rtl_power | anomalies with waterfall |
 
-## Sorun giderme
+Why these tools: readsb is the maintained dump1090 lineage with JSON output; acarsdec/dumpvdl2
+emit JSON natively; AIS-catcher decodes both AIS channels from one dongle; rtl_433 knows hundreds
+of sensor protocols; multimon-ng is a light pipe-friendly AFSK decoder; gr-gsm's scanner reads
+only broadcast cell identities; SatDump is the actively developed Meteor/Inmarsat pipeline;
+faster-whisper is fast on CPU and bilingual.
 
-- **"Dongle bulunamadı"**: Host'ta/konteynerde `rtl_test` çalıştırın. Çıkmıyorsa
-  dongle takılı değil ya da kernel DVB sürücüsü sahiplenmiş olabilir
-  (`install/common.sh` kara listeyi uygular; `rmmod dvb_usb_rtl28xxu`).
-- **LXC'de araç bulunamıyor**: Kaynaktan derlenenler `/usr/local/bin`'dedir;
-  systemd servisi `PATH`'e bunu ekler. Elle çalıştırırken `PATH=/usr/local/bin:$PATH`.
-- **Telegram mesajı gelmiyor**: `run.py --test-telegram`. Bot gruba eklenmiş ve
-  topic kimliği doğru mu? Süpergrup kimliği `-100...` ile başlar.
-- **Transkripsiyon boş/yavaş**: Model ilk çalışmada indirilir (internet gerekir).
-  CPU'da `base`/`tiny` kullanın. `engine: none` ile kapatılabilir.
-- **CPU yüksek**: `spectrum.period_s` artırın, `dwell_s` düşürün, gerekmeyen
-  hedefleri `enabled: false` yapın.
-- **Yetkisiz komut**: `telegram.admins` listesine kendi kullanıcı kimliğinizi
-  ekleyin (`/durum` yetkisiz denemede kimliğinizi yazar; @userinfobot da verir).
-- **Topic çok mesaj alıyor**: `report_mode: summary` (varsayılan) açık mı?
-  `report_nearby_km` küçültün, `individual_max` azaltın ya da `/sustur <kategori>`.
-- **FM ses hedefleri statik kaydediyor**: anten zayıf olabilir; `min_dynamics_db`
-  artırın (3–4), `threshold_dbfs` yükseltin veya rtl_fm `squelch` kalibre edin.
-- **Uydu geçişi hesaplanmıyor**: `data/tle/*.tle` oluşuyor mu? celestrak 5xx verirse
-  `tle_urls` sırasındaki ikinci kaynak (ivanstanojevic) kullanılır; `/gecisler` ile kontrol edin.
-- **Loglar**: `logs/rtlsdr-telegram.log` ve `logs/errors.log`; her araç için
-  `logs/<araç>.log`.
+## Scheduling on one dongle
 
----
+Targets have a class (`pass` for TLE-driven satellites, `waiting` for dwell-hungry decoders,
+`opportunistic` for the rest), a `dwell_s`, a `period_s` and a `priority`. Conflicts resolve as
+**emergency > satellite pass > user /priority > normal cycle**; the normal cycle is fair:
+`score = (lateness / period) / priority`, and a target that never ran goes first. `/status`
+shows what is being listened to and what comes next.
 
-## Lisans
-MIT. Üçüncü taraf araçlar kendi lisanslarına tabidir.
+## Retention and disk safety
+
+`paths.retention_days` / `retention_months` / `retention_years` define a circular window:
+older recordings, events, runs and errors are deleted hourly; the device registry lives three
+times longer so "new device" alerts are not repeated. Per-tool logs rotate at 5 MB, the app log
+at 5 MB × 5, the journal is capped at 200 MB (installer). Below `min_free_disk_pct` the oldest
+recordings are pruned, recording pauses and a warning is posted once a day. SQLite is vacuumed
+monthly.
+
+## Troubleshooting
+
+See the table at the end of [docs/INSTALL.md](docs/INSTALL.md#8-troubleshooting).
+
+## License, donations, legal
+
+This is **source-available** software (see [LICENSE](LICENSE)): evaluate freely for 30 days;
+**supporters who donate any amount may use and modify it for personal, non-commercial purposes
+free of charge, forever**; any commercial use requires a license from the author. External
+decoders keep their own open-source licenses ([THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)).
+Contact / donations / commercial licenses: **haliskilic90@gmail.com**.
+
+The software only receives. You are responsible for complying with the radio-monitoring and
+privacy laws of your country. The GSM target reads broadcast cell identities only and never
+decodes traffic. Distress-beacon detections are best-effort indications, not a safety system —
+always alert the proper authorities.

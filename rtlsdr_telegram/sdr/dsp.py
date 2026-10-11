@@ -1,8 +1,7 @@
-"""Hafif DSP yardımcıları: güç/dBFS ölçümü, FM/AM demodülasyon, WAV yazma.
+"""Light DSP helpers: power/dBFS measurement, FM/AM demodulation, WAV writing.
 
-rtl_433/dump1090 gibi araçlar kendi demodülasyonunu yapar; bu modül yalnızca
-ses bantları (rtl_fm'e alternatif olmayan durumlar) ve spektrum tarayıcının
-ihtiyaç duyduğu basit ölçümler için kullanılır.
+Decoders such as rtl_433 and readsb do their own demodulation; this module only
+serves simple measurements needed by the audio and spectrum paths.
 """
 from __future__ import annotations
 
@@ -14,14 +13,14 @@ from pathlib import Path
 try:
     import numpy as np
     HAVE_NUMPY = True
-except ImportError:  # numpy yoksa yalnızca temel işlevler çalışır
+except ImportError:  # without numpy only the basic functions work
     HAVE_NUMPY = False
 
 
 def u8_iq_to_complex(raw: bytes):
-    """rtl_sdr u8 IQ baytlarını normalize complex64 diziye çevirir."""
+    """Convert rtl_sdr u8 IQ bytes into a normalized complex64 array."""
     if not HAVE_NUMPY:
-        raise RuntimeError("numpy gerekli")
+        raise RuntimeError("numpy required")
     data = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
     data = (data - 127.5) / 127.5
     if len(data) % 2:
@@ -30,7 +29,7 @@ def u8_iq_to_complex(raw: bytes):
 
 
 def power_dbfs(iq) -> float:
-    """Complex örneklerin ortalama gücü (dBFS, tam ölçek = 0)."""
+    """Mean power of complex samples (dBFS, full scale = 0)."""
     if not HAVE_NUMPY:
         return -99.0
     if len(iq) == 0:
@@ -40,9 +39,9 @@ def power_dbfs(iq) -> float:
 
 
 def welch_psd(iq, nfft: int = 1024):
-    """Basit Welch PSD; (freq_bin_index-merkezli dBFS dizi) döndürür."""
+    """Simple Welch PSD; returns a dBFS array centred on the frequency bin index."""
     if not HAVE_NUMPY:
-        raise RuntimeError("numpy gerekli")
+        raise RuntimeError("numpy required")
     n = (len(iq) // nfft) * nfft
     if n == 0:
         return np.full(nfft, -120.0, dtype=np.float32)
@@ -56,9 +55,9 @@ def welch_psd(iq, nfft: int = 1024):
 
 
 def fm_demod(iq, gain: float = 1.0):
-    """Kuadratür FM demodülasyon (diferansiyel faz)."""
+    """Quadrature FM demodulation (differential phase)."""
     if not HAVE_NUMPY:
-        raise RuntimeError("numpy gerekli")
+        raise RuntimeError("numpy required")
     if len(iq) < 2:
         return np.zeros(0, dtype=np.float32)
     prod = iq[1:] * np.conj(iq[:-1])
@@ -67,14 +66,14 @@ def fm_demod(iq, gain: float = 1.0):
 
 def am_demod(iq):
     if not HAVE_NUMPY:
-        raise RuntimeError("numpy gerekli")
+        raise RuntimeError("numpy required")
     mag = np.abs(iq)
     mag = mag - np.mean(mag)
     return mag.astype(np.float32)
 
 
 def write_wav(path: str | Path, samples, rate: int) -> None:
-    """float32 [-1,1] veya int16 örnekleri 16-bit mono WAV'a yazar."""
+    """Write float32 [-1,1] or int16 samples as 16-bit mono WAV."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if HAVE_NUMPY:
@@ -95,7 +94,7 @@ def write_wav(path: str | Path, samples, rate: int) -> None:
 
 
 def rms_dbfs_pcm16(pcm: bytes) -> float:
-    """s16le PCM baytlarının RMS seviyesi (dBFS)."""
+    """RMS level of s16le PCM bytes (dBFS)."""
     if not pcm:
         return -120.0
     if HAVE_NUMPY:

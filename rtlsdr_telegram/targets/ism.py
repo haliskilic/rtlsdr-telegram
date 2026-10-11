@@ -1,10 +1,10 @@
-"""Hedef 5 — Kablosuz sensörler (ISM 433.92 ve 868 MHz).
+"""Target 5 — Wireless sensors (ISM 433.92 and 868 MHz).
 
-Araç: rtl_433 (JSON çıktısı). Hava istasyonu, sıcaklık/nem sensörü, kapı zili,
-lastik basıncı (TPMS) vb. yüzlerce protokolü çözer. İki bandı (433.92 / 868)
-`-H` ile dönüşümlü dinler. "Yeni cihaz görüldü" bildirimi kayıt defteriyle
-yapılır; aynı cihazın tekrar okumaları varsayılan olarak bastırılır
-(report_readings ile açılabilir).
+Tool: rtl_433 (JSON output). Decodes hundreds of protocols: weather stations,
+temperature/humidity sensors, doorbells, tire pressure sensors (TPMS) ...
+Both bands (433.92 / 868) are listened to alternately with `-H`. "New device
+seen" notifications come from the registry; repeated readings of known devices
+are suppressed by default (enable with report_readings).
 """
 from __future__ import annotations
 
@@ -12,39 +12,38 @@ import json
 import threading
 
 from ..events import Category
+from ..i18n import t
 from .base import TargetBase, SlotCollector
 
-# rtl_433 alan adı -> okunur etiket
+# rtl_433 field -> (i18n label key, unit)
 FIELD_LABELS = {
-    "temperature_C": ("Sıcaklık", "°C"), "temperature_F": ("Sıcaklık", "°F"),
-    "humidity": ("Nem", "%"), "pressure_kPa": ("Basınç", "kPa"), "pressure_hPa": ("Basınç", "hPa"),
-    "wind_avg_km_h": ("Rüzgar", "km/s"), "wind_speed_km_h": ("Rüzgar", "km/s"),
-    "wind_dir_deg": ("Rüzgar yönü", "°"), "rain_mm": ("Yağış", "mm"),
-    "battery_ok": ("Pil", ""), "moisture": ("Nem/toprak", "%"),
-    "pressure_PSI": ("Lastik", "PSI"), "pressure_kPa_tpms": ("Lastik", "kPa"),
+    "temperature_C": ("ism.r.temperature", "°C"), "temperature_F": ("ism.r.temperature", "°F"),
+    "humidity": ("ism.r.humidity", "%"), "pressure_kPa": ("ism.r.pressure", "kPa"), "pressure_hPa": ("ism.r.pressure", "hPa"),
+    "wind_avg_km_h": ("ism.r.wind", "km/h"), "wind_speed_km_h": ("ism.r.wind", "km/h"),
+    "wind_dir_deg": ("ism.r.wind_dir", "°"), "rain_mm": ("ism.r.rain", "mm"),
+    "battery_ok": ("ism.r.battery", ""), "moisture": ("ism.r.moisture", "%"),
+    "pressure_PSI": ("ism.r.tire", "PSI"),
 }
-
-# Protokol/model -> kategori ipucu
 DOORBELL_HINTS = ("doorbell", "remote", "button")
-TPMS_HINTS = ("TPMS", "Tpms", "tpms")
 
 
 class ISMTarget(TargetBase):
-    NAME = "ISM Sensör"
+    NAME_KEY = "ism.name"
+    BAND_KEY = "ism.band"
     CATEGORY = Category.ISM
     CLASS = "opportunistic"
     DEFAULTS = {
         "enabled": True, "priority": 5, "dwell_s": 60, "period_s": 300,
         "freqs_mhz": [433.92, 868.0], "hop_s": 30, "gain": "auto",
-        "band_label": "433.92 / 868 MHz ISM", "report_readings": False,
+        "report_readings": False,
         "report_new": True,
-        "individual_max": 2,      # bu sayıya kadar yeni cihaz ayrı mesaj, fazlası tek özet
+        "individual_max": 2,      # up to this many new devices get individual messages, the rest one summary
         "summary_list_max": 15,
     }
 
     def tools_available(self):
         ok = self.cfg.which("rtl_433") is not None
-        return ok, ("" if ok else "rtl_433 yok")
+        return ok, ("" if ok else "rtl_433 not found")
 
     def run_slot(self, stop_event: threading.Event, duration_s: float) -> None:
         if not self.check_tools():
@@ -61,13 +60,13 @@ class ISMTarget(TargetBase):
             cmd += ["-g", str(gain)]
         if self.sdr.ppm:
             cmd += ["-p", str(self.sdr.ppm)]
-        self._collector = SlotCollector(self, "ISM Yeni Cihazlar",
+        self._collector = SlotCollector(self, t("evt.ism_new"),
                                         individual_max=int(self.conf.get("individual_max", 2)),
                                         list_max=int(self.conf.get("summary_list_max", 15)))
         self._slot_seen: set[str] = set()
         self.run_tool_lines(cmd, stop_event, duration_s, self._on_line, name="rtl_433", log_name="rtl_433")
-        self._collector.flush(freq_mhz=None, summary_prefix="Yeni cihaz: ",
-                              extra_body=f"Bu slotta {len(self._slot_seen)} farklı cihaz duyuldu.")
+        self._collector.flush(freq_mhz=None, summary_prefix=t("ism.summary_prefix"),
+                              extra_body=t("ism.slot_seen", n=len(self._slot_seen)))
 
     def _on_line(self, line: str):
         line = line.strip()
@@ -77,7 +76,7 @@ class ISMTarget(TargetBase):
             d = json.loads(line)
         except ValueError:
             return
-        model = d.get("model") or "Bilinmeyen"
+        model = d.get("model") or t("common.unknown")
         dev_id = d.get("id", d.get("address", d.get("sensor_id", "")))
         channel = d.get("channel")
         key = f"{model}:{dev_id}" + (f":{channel}" if channel is not None else "")
@@ -93,13 +92,13 @@ class ISMTarget(TargetBase):
         if not is_new and not readings:
             return
 
-        body = [f"Model      : {model}", f"Kimlik     : {dev_id}"]
+        body = [f"{t('ism.model')}: {model}", f"{t('ism.id')}: {dev_id}"]
         if channel is not None:
-            body.append(f"Kanal      : {channel}")
+            body.append(f"{t('ism.channel')}: {channel}")
         if readings:
             body.append("")
             body.extend(readings)
-        summary = (f"Yeni {kind}: {model}" if is_new else f"{model}") + (f" (#{dev_id})" if dev_id != "" else "")
+        summary = ((t("ism.new_prefix", kind=kind) + f": {model}") if is_new else f"{model}") + (f" (#{dev_id})" if dev_id != "" else "")
         ev = self.make_event(
             f"ISM {kind}", summary=summary, body="\n".join(body),
             freq_mhz=round(d.get("freq", 0) or 0, 3) or None,
@@ -107,7 +106,7 @@ class ISMTarget(TargetBase):
             signal_value=rssi if isinstance(rssi, (int, float)) else None,
             dedup_key=f"ism-{key}" if is_new else None)
         if is_new:
-            # yeni cihazlar slot sonunda toplu/ayrı gönderilir (sel koruması)
+            # new devices are flushed at the end of the slot, individually or as one summary (flood control)
             line = f"• {kind}: {model} #{dev_id}" + (f" ({readings[0].split(':')[-1].strip()})" if readings else "")
             self._collector.add(line, ev, sort_key=float(rssi) if isinstance(rssi, (int, float)) else -99)
         else:
@@ -116,23 +115,24 @@ class ISMTarget(TargetBase):
     def _classify(self, model: str, d: dict) -> str:
         m = model.lower()
         if "tpms" in m or "pressure_psi" in {k.lower() for k in d}:
-            return "Lastik (TPMS)"
+            return t("ism.kind.tpms")
         if any(h in m for h in DOORBELL_HINTS):
-            return "Kapı zili/Kumanda"
+            return t("ism.kind.doorbell")
         if any(k in d for k in ("wind_avg_km_h", "wind_speed_km_h", "rain_mm")):
-            return "Hava istasyonu"
+            return t("ism.kind.weather")
         if any(k in d for k in ("temperature_C", "temperature_F", "humidity")):
-            return "Sıcaklık/Nem sensörü"
-        return "Cihaz"
+            return t("ism.kind.temp")
+        return t("ism.kind.device")
 
     @staticmethod
     def _format_readings(d: dict) -> list[str]:
         out = []
-        for field, (label, unit) in FIELD_LABELS.items():
+        for field, (label_key, unit) in FIELD_LABELS.items():
             if field in d:
                 val = d[field]
+                label = t(label_key)
                 if field == "battery_ok":
-                    out.append(f"{label}      : {'iyi' if val else 'ZAYIF ⚠️'}")
+                    out.append(f"{label}: {t('ism.battery_ok') if val else t('ism.battery_low')}")
                 else:
-                    out.append(f"{label}      : {val} {unit}".rstrip())
+                    out.append(f"{label}: {val} {unit}".rstrip())
         return out

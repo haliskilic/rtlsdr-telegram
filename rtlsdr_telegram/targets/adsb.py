@@ -1,13 +1,13 @@
-"""Hedef 1 — Uçak takibi (ADS-B, 1090 MHz).
+"""Target 1 — Aircraft tracking (ADS-B, 1090 MHz).
 
-Araç: readsb (dump1090 uyumlu). readsb'yi JSON yazma kipinde çalıştırıp
-aircraft.json dosyasını periyodik okuruz. Çağrı kodu, konum, irtifa, hız;
-alçak uçuş ve acil squawk (7500/7600/7700) tespiti yapılır.
+Tool: readsb (dump1090-compatible). readsb runs in JSON-writer mode and we poll
+aircraft.json periodically. Callsign, position, altitude, speed, low-altitude
+and emergency squawk (7500/7600/7700) detection.
 
-Sel koruması: havalimanı yakınında onlarca uçak görünür. Varsayılan kip
-"summary": slot sonunda tek özet mesajı (en yakın/alçak uçaklar listesiyle).
-Yalnız acil squawk, alçak uçuş ve `report_nearby_km` içindeki uçaklar ayrı
-mesaj üretir. "each" kipi her yeni uçağı ayrı bildirir.
+Flood control: near an airport dozens of aircraft are visible. The default
+mode "summary" sends ONE summary per slot (with a nearest/lowest list); only
+emergency squawks, low-altitude and aircraft within `report_nearby_km` get an
+individual message. Mode "each" reports every new aircraft separately.
 """
 from __future__ import annotations
 
@@ -18,33 +18,31 @@ import time
 from pathlib import Path
 
 from ..events import Category, PRIO_EMERGENCY, PRIO_IMPORTANT
-from ..geo import haversine_km, bearing_deg, compass_tr
+from ..geo import haversine_km, bearing_deg, compass
+from ..i18n import t
 from .base import TargetBase, SlotCollector
 
-SQUAWK_EMERGENCY = {
-    "7500": "Uçak kaçırma (hijack)",
-    "7600": "Telsiz arızası",
-    "7700": "Genel acil durum",
-}
+SQUAWK_EMERGENCY = {"7500": "sq.7500", "7600": "sq.7600", "7700": "sq.7700"}
 
 
 class ADSBTarget(TargetBase):
-    NAME = "ADS-B Uçak"
+    NAME_KEY = "adsb.name"
+    BAND_KEY = "adsb.band"
     CATEGORY = Category.HAVACILIK
     CLASS = "waiting"
     DEFAULTS = {
         "enabled": True, "priority": 3, "dwell_s": 90, "period_s": 300,
-        "freq_mhz": 1090.0, "gain": "auto", "band_label": "1090 MHz ADS-B",
+        "freq_mhz": 1090.0, "gain": "auto",
         "low_alt_ft": 3000, "min_messages": 3, "tool": "readsb",
         "report_mode": "summary",        # summary | each
-        "report_nearby_km": 8.0,         # bu mesafe içindeki yeni uçak ayrı mesaj
+        "report_nearby_km": 8.0,         # new/low aircraft within this distance get their own message
         "summary_list_max": 12,
         "emergency_realert_min": 60,
     }
 
     def tools_available(self):
         b = self._binary()
-        return (b is not None), ("" if b else "readsb/dump1090 bulunamadı")
+        return (b is not None), ("" if b else "readsb/dump1090 not found")
 
     def _binary(self):
         return self.cfg.which(self.conf.get("tool", "readsb"), "readsb", "dump1090", "dump1090-fa")
@@ -63,7 +61,7 @@ class ADSBTarget(TargetBase):
                 cmd += ["--gain", str(gain)]
             if self.sdr.ppm:
                 cmd += ["--ppm", str(self.sdr.ppm)]
-        else:  # dump1090 türevleri
+        else:  # dump1090 variants
             cmd = [binary, "--write-json", str(jdir), "--write-json-every", "1", "--quiet"]
             if not self.sdr.is_auto_gain(gain):
                 cmd += ["--gain", str(gain)]
@@ -74,19 +72,19 @@ class ADSBTarget(TargetBase):
         try:
             proc.start()
         except Exception as e:
-            self.log_error(f"readsb başlatılamadı: {e}")
+            self.log_error(f"readsb failed to start: {e}")
             return
         jfile = jdir / "aircraft.json"
         deadline = time.time() + duration_s
-        slot: dict[str, dict] = {}   # hex -> en son görülen bilgiler (bu slot)
-        collector = SlotCollector(self, "ADS-B Özet", individual_max=0,
+        slot: dict[str, dict] = {}   # hex -> latest info seen in this slot
+        collector = SlotCollector(self, t("evt.adsb_summary"), individual_max=0,
                                   list_max=int(self.conf.get("summary_list_max", 12)))
         started = time.time()
         try:
             while time.time() < deadline and not stop_event.is_set():
                 if not proc.running:
                     if time.time() - started < 5 and looks_like_device_error(proc.stderr_tail):
-                        self.log.debug("adsb: dongle meşgul, kısa bekleme sonrası yeniden deneniyor")
+                        self.log.debug("adsb: dongle busy, retrying after a short wait")
                         proc.stop(); time.sleep(1.5)
                         proc = ManagedProcess(cmd, name="adsb", log_path=self.cfg.log_dir / "adsb.log")
                         proc.start(); started = time.time()
@@ -134,10 +132,10 @@ class ADSBTarget(TargetBase):
             if first_in_slot:
                 is_new, _, _ = self.registry_touch("aircraft", hexid, {"flight": flight or None})
                 rec["new"] = is_new
-            # acil squawk: her zaman ve hemen
+            # emergency squawk: always and immediately
             if squawk in SQUAWK_EMERGENCY:
                 self._maybe_emergency(hexid, rec, squawk)
-            # yakın/alçak uçak: hemen ayrı mesaj (slot başına bir kez)
+            # nearby/low aircraft: immediate individual message (once per slot)
             if not rec["nearby_sent"] and self._is_notable(rec):
                 rec["nearby_sent"] = True
                 self._emit_aircraft(hexid, rec, notable=True)
@@ -155,7 +153,7 @@ class ADSBTarget(TargetBase):
     def _loc(self, rec):
         if rec.get("lat") is None or rec.get("dist") is None:
             return None
-        return f"{rec['lat']:.4f}, {rec['lon']:.4f} ({rec['dist']:.1f} km {compass_tr(rec['brg'])})"
+        return f"{rec['lat']:.4f}, {rec['lon']:.4f} ({rec['dist']:.1f} km {compass(rec['brg'])})"
 
     def _maybe_emergency(self, hexid, rec, squawk):
         key = f"{hexid}-{squawk}"
@@ -165,15 +163,15 @@ class ADSBTarget(TargetBase):
             self.registry_touch("adsb_emerg", key)
             return
         self.registry_touch("adsb_emerg", key, {"flight": rec.get("flight")})
-        label = SQUAWK_EMERGENCY[squawk]
+        label = t(SQUAWK_EMERGENCY[squawk])
         body = [f"<b>Squawk {squawk}</b> — {label}", f"ICAO: <code>{hexid.upper()}</code>",
-                f"Çağrı: {rec.get('flight') or '—'}"]
+                f"{t('adsb.callsign')}: {rec.get('flight') or '—'}"]
         if rec.get("alt") is not None:
-            body.append(f"İrtifa: {rec['alt']} ft")
+            body.append(f"{t('adsb.altitude')}: {rec['alt']} ft")
         if rec.get("gs") is not None:
-            body.append(f"Yer hızı: {rec['gs']:.0f} kt")
+            body.append(f"{t('adsb.gs')}: {rec['gs']:.0f} kt")
         ev = self.make_event(
-            f"ACİL {squawk} • Uçak", summary=f"{label}: {rec.get('flight') or hexid.upper()}",
+            t("evt.adsb_emerg", sq=squawk), summary=f"{label}: {rec.get('flight') or hexid.upper()}",
             body="\n".join(body), freq_mhz=1090.0, lat=rec.get("lat"), lon=rec.get("lon"),
             location_text=self._loc(rec), signal=self._sig(rec), signal_value=rec.get("rssi"),
             priority=PRIO_EMERGENCY, dedup_key=f"adsb-emerg-{key}")
@@ -187,21 +185,21 @@ class ADSBTarget(TargetBase):
 
     def _emit_aircraft(self, hexid, rec, notable: bool):
         low = isinstance(rec.get("alt"), (int, float)) and rec["alt"] <= float(self.conf.get("low_alt_ft", 3000))
-        body = [f"ICAO adresi: <code>{hexid.upper()}</code>", f"Çağrı kodu : {rec.get('flight') or '—'}"]
+        body = [f"{t('adsb.icao')}: <code>{hexid.upper()}</code>", f"{t('adsb.callsign')}: {rec.get('flight') or '—'}"]
         if rec.get("alt") is not None:
-            body.append(f"İrtifa     : {rec['alt']} ft" + ("  ⚠️ alçak uçuş" if low else ""))
+            body.append(f"{t('adsb.altitude')}: {rec['alt']} ft" + (f"  ⚠️ {t('adsb.low_alt')}" if low else ""))
         if rec.get("gs") is not None:
-            body.append(f"Yer hızı   : {rec['gs']:.0f} kt")
+            body.append(f"{t('adsb.gs')}: {rec['gs']:.0f} kt")
         if rec.get("track") is not None:
-            body.append(f"Yön        : {rec['track']:.0f}° ({compass_tr(rec['track'])})")
+            body.append(f"{t('adsb.track')}: {rec['track']:.0f}° ({compass(rec['track'])})")
         if rec.get("squawk"):
-            body.append(f"Squawk     : {rec['squawk']}")
-        what = "Yakın uçak" if notable else "Yeni uçak"
+            body.append(f"{t('adsb.squawk')}: {rec['squawk']}")
+        what = t("adsb.nearby") if notable else t("adsb.new")
         summary = f"{what} {rec.get('flight') or hexid.upper()}"
         if rec.get("dist") is not None:
             summary += f" — {rec['dist']:.1f} km"
         ev = self.make_event(
-            self.NAME, summary=summary, body="\n".join(body), freq_mhz=1090.0,
+            self.display_name(), summary=summary, body="\n".join(body), freq_mhz=1090.0,
             lat=rec.get("lat"), lon=rec.get("lon"), location_text=self._loc(rec),
             signal=self._sig(rec), signal_value=rec.get("rssi"),
             priority=(PRIO_IMPORTANT if (notable and low) else self.priority),
@@ -219,18 +217,18 @@ class ADSBTarget(TargetBase):
         lines = []
         for h, r in with_pos[: int(self.conf.get("summary_list_max", 12))]:
             alt = f"{r['alt']} ft" if r.get("alt") is not None else "—"
-            lines.append(f"• {r.get('flight') or h.upper():<8} {alt:>9}  {r['dist']:5.1f} km {compass_tr(r['brg'])}"
+            lines.append(f"• {r.get('flight') or h.upper():<8} {alt:>9}  {r['dist']:5.1f} km {compass(r['brg'])}"
                          + ("  🆕" if r.get("new") else ""))
         more = len(slot) - len(lines)
-        body = [f"Toplam {len(slot)} uçak ({new_n} yeni), konumlu {len(with_pos)}",
-                f"Dinleme süresi: {elapsed:.0f} sn", ""] + lines
+        body = [t("adsb.total", n=len(slot), new=new_n, pos=len(with_pos)),
+                f"{t('common.listen_time')}: {elapsed:.0f} {t('unit.s')}", ""] + lines
         if more > 0:
-            body.append(f"… ve {more} uçak daha")
-        near_txt = f", en yakın {with_pos[0][1]['dist']:.1f} km" if with_pos else ""
+            body.append(t("adsb.more", n=more))
+        near_txt = t("adsb.nearest", d=f"{with_pos[0][1]['dist']:.1f}") if with_pos else ""
         ev = self.make_event(
-            "ADS-B Özet", summary=f"{len(slot)} uçak görüldü ({new_n} yeni){near_txt}",
+            t("evt.adsb_summary"), summary=t("adsb.summary_line", n=len(slot), new=new_n) + near_txt,
             body="\n".join(body), freq_mhz=1090.0, duration_s=elapsed,
-            signal=(f"{best:.1f} dBFS (en güçlü)" if best is not None else None), signal_value=best,
+            signal=(f"{best:.1f} dBFS" if best is not None else None), signal_value=best,
             extra={"aircraft": len(slot), "new": new_n})
         self.emit(ev)
 

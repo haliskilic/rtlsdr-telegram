@@ -1,18 +1,20 @@
-"""Hedef 6 — Amatör paket (APRS, 144.800 MHz).
+"""Target 6 — Amateur packet radio (APRS, 144.800 MHz).
 
-Araç: rtl_fm → multimon-ng (AFSK1200) borusu. Çözülen TNC2 çerçeveleri aprslib
-ile ayrıştırılır: konum, çağrı işareti, sembol, kısa mesaj/durum. İstasyon ilk
-görüldüğünde "yeni istasyon", mesaj paketlerinde içerik bildirilir.
+Tool: rtl_fm -> multimon-ng (AFSK1200) pipeline. Decoded TNC2 frames are parsed
+with aprslib: position, callsign, symbol, short message/status. A station is
+reported when first seen; message packets are always reported.
 
-multimon-ng'yi seçtik: hafif, borudan ham ses alır, APRS/AFSK1200 çözer.
-direwolf de kullanılabilir (config.tool).
+multimon-ng was chosen because it is light, takes raw audio from a pipe and
+decodes APRS/AFSK1200. direwolf can be used instead (config.tool).
 """
 from __future__ import annotations
 
 import threading
 
 from ..events import Category
-from ..geo import haversine_km, bearing_deg, compass_tr
+from ..geo import haversine_km, bearing_deg, compass
+from ..i18n import t
+from ..proc import shell_pipeline
 from .base import TargetBase
 
 try:
@@ -23,20 +25,21 @@ except ImportError:
 
 
 class APRSTarget(TargetBase):
-    NAME = "APRS Paket"
+    NAME_KEY = "aprs.name"
+    BAND_KEY = "aprs.band"
     CATEGORY = Category.AMATOR
     CLASS = "opportunistic"
     DEFAULTS = {
         "enabled": True, "priority": 5, "dwell_s": 45, "period_s": 300,
-        "freq_mhz": 144.800, "gain": "auto", "band_label": "144.800 MHz APRS",
+        "freq_mhz": 144.800, "gain": "auto",
         "report_all_packets": False,
     }
 
     def tools_available(self):
         if not self.sdr.bin_rtl_fm:
-            return False, "rtl_fm yok"
+            return False, "rtl_fm not found"
         if not self.cfg.which("multimon-ng", "direwolf"):
-            return False, "multimon-ng/direwolf yok"
+            return False, "multimon-ng/direwolf not found"
         return True, ""
 
     def run_slot(self, stop_event: threading.Event, duration_s: float) -> None:
@@ -50,10 +53,10 @@ class APRSTarget(TargetBase):
         if mm:
             pipeline = " ".join(self._q(rtl)) + f" | {self._q1(mm)} -t raw -a AFSK1200 -A -"
         else:
-            # direwolf alternatifi
+            # direwolf alternative
             dw = self.cfg.which("direwolf")
             pipeline = " ".join(self._q(rtl)) + f" | {self._q1(dw)} -r {rate} -D 1 -t 0 -q d -"
-        self.run_tool_lines(["bash", "-c", pipeline], stop_event, duration_s, self._on_line,
+        self.run_tool_lines(shell_pipeline(pipeline), stop_event, duration_s, self._on_line,
                             name="aprs", log_name="aprs")
 
     @staticmethod
@@ -71,7 +74,7 @@ class APRSTarget(TargetBase):
         if line.startswith("APRS:"):
             frame = line[5:].strip()
         elif ">" in line and ":" in line and HAVE_APRSLIB and not line.startswith(("Enabled", "multimon", "Using")):
-            # direwolf ham çerçeve satırı olabilir
+            # may be a raw direwolf frame line
             frame = line.strip()
         if not frame:
             return
@@ -90,11 +93,11 @@ class APRSTarget(TargetBase):
                 lon = p.get("longitude")
                 comment = p.get("comment", "") or ""
                 if p.get("message_text"):
-                    info = f"Mesaj: {p['message_text']}"
+                    info = f"{t('aprs.message')}: {p['message_text']}"
                 elif p.get("status"):
-                    info = f"Durum: {p['status']}"
+                    info = f"{t('aprs.status')}: {p['status']}"
                 elif p.get("weather"):
-                    info = "Hava verisi içeriyor"
+                    info = t("aprs.weather")
             except Exception:
                 info = frame.split(":", 1)[-1][:120] if ":" in frame else ""
         else:
@@ -110,17 +113,17 @@ class APRSTarget(TargetBase):
         dist = None
         if lat is not None and lon is not None and slat is not None:
             dist = haversine_km(slat, slon, lat, lon)
-            loc_txt = f"{lat:.4f}, {lon:.4f} ({dist:.1f} km {compass_tr(bearing_deg(slat, slon, lat, lon))})"
+            loc_txt = f"{lat:.4f}, {lon:.4f} ({dist:.1f} km {compass(bearing_deg(slat, slon, lat, lon))})"
 
-        body = [f"Çağrı işareti: {src}"]
+        body = [f"{t('aprs.callsign')}: {src}"]
         if comment:
-            body.append(f"Yorum        : {self._trim(comment)}")
+            body.append(f"{t('aprs.comment')}: {self._trim(comment)}")
         if info:
             body.append(info)
         body.append(f"\n<code>{self._trim(frame, 200)}</code>")
-        summary = (f"Yeni istasyon {src}" if is_new else f"{src}") + (f" — {dist:.0f} km" if dist is not None else "")
+        summary = (f"{t('aprs.new')} {src}" if is_new else f"{src}") + (f" — {dist:.0f} km" if dist is not None else "")
         ev = self.make_event(
-            self.NAME, summary=summary, body="\n".join(body),
+            self.display_name(), summary=summary, body="\n".join(body),
             freq_mhz=self.conf.get("freq_mhz", 144.8), lat=lat, lon=lon, location_text=loc_txt,
             dedup_key=f"aprs-{src}" if is_new else None)
         self.emit(ev)

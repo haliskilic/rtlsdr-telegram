@@ -1,4 +1,4 @@
-"""Hedef temel sınıfı ve ortak bağlam (context)."""
+"""Target base class and shared context."""
 from __future__ import annotations
 
 import os
@@ -11,12 +11,13 @@ from pathlib import Path
 from typing import Any
 
 from ..events import Event, Category, Attachment, PRIO_NORMAL, esc
+from ..i18n import t
 from ..proc import ManagedProcess, looks_like_device_error
 
 
 @dataclass
 class TargetContext:
-    """Hedeflere enjekte edilen paylaşımlı bağımlılıklar."""
+    """Shared dependencies injected into every target."""
     cfg: Any
     sdr: Any
     storage: Any
@@ -28,25 +29,27 @@ class TargetContext:
 
 
 class TargetBase:
-    """Tüm izleme hedeflerinin ortak davranışı.
+    """Common behaviour of all monitoring targets.
 
-    Alt sınıflar en azından `run_slot()` uygular ve sınıf nitelikleriyle kimliğini
-    bildirir. Zamanlayıcı, dongle gereken hedefler için dongle'ı kiralar ve
-    `run_slot(stop_event, seconds)` çağırır.
+    Subclasses implement at least `run_slot()` and describe themselves with class
+    attributes. The scheduler leases the dongle for targets that need it and
+    calls `run_slot(stop_event, seconds)`.
     """
 
-    #: config.targets içindeki anahtar (build sırasında atanır)
+    #: key inside config.targets (assigned at build time)
     KEY: str = ""
-    #: insan-okur ad
+    #: human-readable name (literal) or NAME_KEY (i18n key, preferred)
     NAME: str = ""
+    NAME_KEY: str = ""
+    BAND_KEY: str = ""
     #: olay kategorisi
     CATEGORY: Category = Category.TARAMA
-    #: dongle'ı özel olarak gerektirir mi (tüm RF hedefleri evet)
+    #: needs exclusive access to the dongle (all RF targets do)
     NEEDS_DEVICE: bool = True
-    #: "waiting" (frekansta süre ayırır; normal döngüde uzun dwell) |
-    #: "opportunistic" (fırsatçı) | "pass" (yalnız TLE geçiş penceresinde — uydu/ISS)
+    #: "waiting" (needs dwell time on its frequency; long dwell in the normal cycle) |
+    #: "opportunistic" | "pass" (only inside a TLE pass window — satellites/ISS)
     CLASS: str = "opportunistic"
-    #: hedefe özel varsayılan yapılandırma (config DEFAULTS'a kaydedilir)
+    #: target-specific default configuration (registered into config DEFAULTS)
     DEFAULTS: dict = {}
 
     def __init__(self, key: str, ctx: TargetContext):
@@ -66,7 +69,7 @@ class TargetBase:
         self.error_count = 0
         self._tools_ok: bool | None = None
 
-    # -------------------------------------------------- yapılandırma kaydı
+    # -------------------------------------------------- configuration registration
     @classmethod
     def register_defaults(cls, cfg, key: str) -> None:
         cfg.register_target_defaults(key, cls.full_defaults())
@@ -77,7 +80,7 @@ class TargetBase:
         base.update(cls.DEFAULTS or {})
         return base
 
-    # --------------------------------------------------------- özellikler
+    # --------------------------------------------------------- properties
     @property
     def enabled(self) -> bool:
         return bool(self.conf.get("enabled", True))
@@ -96,16 +99,20 @@ class TargetBase:
 
     @property
     def band_label(self) -> str:
-        return self.conf.get("band_label", self.NAME)
+        if self.conf.get("band_label"):
+            return self.conf["band_label"]
+        return t(self.BAND_KEY) if self.BAND_KEY else self.display_name()
 
     def display_name(self) -> str:
+        if self.NAME_KEY:
+            return t(self.NAME_KEY)
         return self.NAME or self.KEY
 
     def needs_device(self) -> bool:
         return self.NEEDS_DEVICE
 
     def tools_available(self) -> tuple[bool, str]:
-        """Harici araç gereksinimini kontrol eder. (ok, mesaj)."""
+        """Check external tool requirements; returns (ok, message)."""
         return True, ""
 
     def check_tools(self) -> bool:
@@ -113,18 +120,18 @@ class TargetBase:
             ok, msg = self.tools_available()
             self._tools_ok = ok
             if not ok:
-                self.log.warning("araç eksik: %s", msg)
+                self.log.warning("tool missing: %s", msg)
         return self._tools_ok
 
     # --------------------------------------------------- zamanlama girdisi
     def due_in(self, now: float) -> float:
-        """Bir sonraki çalışmaya kalan saniye (fırsatçı hedefler için)."""
+        """Seconds until the next run (for cycle targets)."""
         return max(0.0, (self.last_run + self.period_s) - now)
 
     def wants_slot(self, now: float) -> bool:
         return self.enabled and self.due_in(now) <= 0
 
-    # --------------------------------------------------- olay üretimi
+    # --------------------------------------------------- event production
     def make_event(self, event_type: str, *, summary: str = "", body: str = "", freq_mhz=None,
                    band: str | None = None, signal: str | None = None, signal_value=None,
                    lat=None, lon=None, location_text=None, priority: int | None = None,
@@ -157,15 +164,15 @@ class TargetBase:
         except Exception:
             pass
 
-    # --------------------------------------------- kayıt defteri (yeni cihaz)
+    # --------------------------------------------- registry (new device detection)
     def registry_touch(self, kind: str, key: str, data: dict | None = None):
         return self.st.registry_touch(kind, key, data)
 
-    # --------------------------------------------- araç çalıştırma yardımcısı
+    # --------------------------------------------- tool runner helper
     def run_tool_lines(self, cmd: list[str], stop_event: threading.Event, duration_s: float,
                        on_line, *, name: str = "", log_name: str | None = None,
                        on_stderr=None) -> int:
-        """Aracı başlatır, süre/iptal olana kadar satırları `on_line`'a iletir."""
+        """Start the tool and forward output lines to `on_line` until the deadline or a stop."""
         log_path = None
         if log_name:
             log_path = self.cfg.log_dir / f"{log_name}.log"
@@ -184,7 +191,7 @@ class TargetBase:
             try:
                 proc.start()
             except Exception as e:
-                self.log_error(f"araç başlatılamadı: {e}")
+                self.log_error(f"tool failed to start: {e}")
                 return 0
             try:
                 while time.time() < deadline and not stop_event.is_set():
@@ -200,33 +207,33 @@ class TargetBase:
             rc = proc.returncode or 0
             early_exit = (time.time() - started) < 4.0 and not stop_event.is_set() and time.time() < deadline
             if early_exit and looks_like_device_error(proc.stderr_tail):
-                # dongle henüz bırakılmamış olabilir — kısa bekle, bir kez daha dene
-                self.log.debug("%s: dongle meşgul görünüyor, yeniden deneniyor", name or self.KEY)
+                # the dongle may not be released yet — wait briefly and retry once
+                self.log.debug("%s: dongle looks busy, retrying", name or self.KEY)
                 time.sleep(1.5)
                 continue
             if early_exit and rc not in (0, None):
                 tail = " | ".join(list(proc.stderr_tail)[-3:])
-                self.log_error(f"{name or self.KEY} erken çıktı (rc={rc}): {tail[:300]}")
+                self.log_error(f"{name or self.KEY} exited early (rc={rc}): {tail[:300]}")
             break
         return rc
 
-    # ------------------------------------------------------- çalıştırma
+    # ------------------------------------------------------- run
     def run_slot(self, stop_event: threading.Event, duration_s: float) -> None:
-        """Hedefi dongle ile `duration_s` saniye çalıştırır. Alt sınıf uygular."""
+        """Run the target with the dongle for `duration_s` seconds (implemented by subclasses)."""
         raise NotImplementedError
 
-    # ------------------------------------------------ bekleme-hedefi pencereleri
+    # ------------------------------------------------ pass windows
     def next_window(self, now: float):
-        """'waiting' hedefleri için bir sonraki zamanlanmış pencere (başlangıç, bitiş) ya da None."""
+        """Next scheduled window (start, end) for 'pass' targets, else None."""
         return None
 
 
 
 def audio_attachment(path: str, caption: str | None = None, delete_after: bool = False) -> Attachment:
-    """Dosya uzantısına göre doğru Telegram ek türünü seçer.
+    """Pick the right Telegram attachment kind from the file extension.
 
-    Telegram sendVoice yalnızca OGG/OPUS (veya MP3/M4A) kabul eder; WAV için
-    sendDocument kullanılmalıdır, aksi halde gönderim reddedilir."""
+    Telegram sendVoice only accepts OGG/OPUS (or MP3/M4A); WAV must go through
+    sendDocument or the upload is rejected."""
     p = str(path).lower()
     if p.endswith((".ogg", ".oga", ".opus")):
         kind = "voice"
@@ -238,12 +245,12 @@ def audio_attachment(path: str, caption: str | None = None, delete_after: bool =
 
 
 class SlotCollector:
-    """Bir slot boyunca biriken ögeleri tek özet mesajında (sel koruması) toplar.
+    """Collects items during a slot and flushes them as one summary (flood control).
 
-    Yoğun ortamlarda (havalimanı yakını ADS-B, Marmara AIS, şehir içi ISM) her
-    tespit için ayrı mesaj göndermek topic'i boğar. Bunun yerine hedef, slot
-    boyunca `add()` ile öge biriktirir; `flush()` öge sayısı `individual_max`
-    altındaysa ayrı olaylar, üstündeyse tek özet olay üretir."""
+    In dense environments (ADS-B near an airport, AIS in busy waters, urban ISM)
+    one message per detection would flood the topic. Targets `add()` items during
+    the slot; `flush()` emits individual events when the count is within
+    `individual_max`, otherwise a single summary event."""
 
     def __init__(self, target: "TargetBase", title: str, *, individual_max: int = 3, list_max: int = 15):
         self.target = target
@@ -277,11 +284,11 @@ class SlotCollector:
         more = n - len(lines)
         body = "\n".join(lines)
         if more > 0:
-            body += f"\n… ve {more} öge daha"
+            body += "\n" + t("common.more_items", n=more)
         if extra_body:
             body = extra_body + "\n\n" + body
         ev = self.target.make_event(
-            self.title, summary=f"{summary_prefix}{n} öge",
+            self.title, summary=f"{summary_prefix}{t('common.items', n=n)}",
             body=body, freq_mhz=freq_mhz, band=band,
             priority=self.target.priority if priority is None else priority)
         self.target.emit(ev)

@@ -1,16 +1,19 @@
-"""Ortak olay (Event) veri modeli ve Telegram mesaj biçimlendirme.
+"""Common event (Event) data model and Telegram message formatting.
 
-Tüm hedefler bu modeli üretir; Dispatcher aynı modeli HTML mesajına çevirir.
-Başlık şablonu (madde 5):
+Every target produces this model; the Dispatcher turns it into an HTML message.
+Header template (spec section 5), labels localized through i18n:
 
-  [EMOJİ] [OLAY TÜRÜ] • [KATEGORİ]
-  ├ Frekans aralığı : ...
-  ├ Yakalanan frekans: ...
-  ├ Zaman           : ...
-  ├ Süre            : ...
-  ├ Sinyal gücü     : ...
-  ├ Konum           : ...
-  └ Özet            : ...
+  [EMOJI] [EVENT TYPE] • [CATEGORY]
+  ├ Band      : ...
+  ├ Frequency : ...
+  ├ Time      : ...
+  ├ Duration  : ...
+  ├ Signal    : ...
+  ├ Location  : ...
+  └ Summary   : ...
+
+Category values are language-neutral keys (stored in the database); their
+display names come from i18n so the language can be switched at any time.
 """
 from __future__ import annotations
 
@@ -23,49 +26,72 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .geo import format_location
+from .i18n import t
 
 
 class Category(str, Enum):
-    HAVACILIK = "Havacılık"
-    DENIZCILIK = "Denizcilik"
-    UYDU = "Uydu"
-    METEOROLOJI = "Meteoroloji"
-    AMATOR = "Amatör Telsiz"
-    ISM = "ISM/Sensör"
-    ACIL = "Acil Durum"
-    HUCRESEL = "Hücresel"
-    TARAMA = "Genel Tarama"
-    SISTEM = "Sistem"
+    HAVACILIK = "aviation"
+    DENIZCILIK = "maritime"
+    UYDU = "satellite"
+    METEOROLOJI = "weather"
+    AMATOR = "amateur"
+    ISM = "ism"
+    ACIL = "emergency"
+    HUCRESEL = "cellular"
+    TARAMA = "scan"
+    SISTEM = "system"
+
+    @property
+    def label(self) -> str:
+        """Localized display name."""
+        return t(f"cat.{self.value}")
 
     @classmethod
     def parse(cls, text: str) -> "Category | None":
-        t = (text or "").strip().lower().replace("_", " ").replace("-", " ")
+        """Accept keys, English and Turkish names and common aliases."""
+        raw = (text or "").strip().lower().replace("_", " ").replace("-", " ")
+        if not raw:
+            return None
+        for c in cls:
+            if raw == c.value or raw == c.label.lower() or raw == t_en(f"cat.{c.value}").lower() \
+                    or raw == LEGACY_TR_NAMES.get(c, "").lower():
+                return c
         aliases = {
-            "havacilik": cls.HAVACILIK, "havacılık": cls.HAVACILIK, "ucak": cls.HAVACILIK, "uçak": cls.HAVACILIK,
-            "denizcilik": cls.DENIZCILIK, "deniz": cls.DENIZCILIK, "gemi": cls.DENIZCILIK,
-            "uydu": cls.UYDU, "meteoroloji": cls.METEOROLOJI, "balon": cls.METEOROLOJI,
-            "amator": cls.AMATOR, "amatör": cls.AMATOR, "amator telsiz": cls.AMATOR, "amatör telsiz": cls.AMATOR,
-            "ism": cls.ISM, "sensor": cls.ISM, "sensör": cls.ISM, "ism/sensor": cls.ISM, "ism/sensör": cls.ISM,
-            "acil": cls.ACIL, "acil durum": cls.ACIL, "hucresel": cls.HUCRESEL, "hücresel": cls.HUCRESEL, "gsm": cls.HUCRESEL,
-            "tarama": cls.TARAMA, "genel tarama": cls.TARAMA, "spektrum": cls.TARAMA, "sistem": cls.SISTEM,
+            "havacilik": cls.HAVACILIK, "ucak": cls.HAVACILIK, "uçak": cls.HAVACILIK, "aircraft": cls.HAVACILIK,
+            "air": cls.HAVACILIK, "deniz": cls.DENIZCILIK, "gemi": cls.DENIZCILIK, "marine": cls.DENIZCILIK,
+            "ship": cls.DENIZCILIK, "sat": cls.UYDU, "space": cls.UYDU, "balon": cls.METEOROLOJI,
+            "meteo": cls.METEOROLOJI, "weather": cls.METEOROLOJI, "amator": cls.AMATOR, "amatör": cls.AMATOR,
+            "amator telsiz": cls.AMATOR, "amatör telsiz": cls.AMATOR, "ham": cls.AMATOR, "sensor": cls.ISM,
+            "sensör": cls.ISM, "sensors": cls.ISM, "ism/sensor": cls.ISM, "ism/sensör": cls.ISM,
+            "ism/sensors": cls.ISM, "acil": cls.ACIL, "acil durum": cls.ACIL, "hucresel": cls.HUCRESEL,
+            "hücresel": cls.HUCRESEL, "gsm": cls.HUCRESEL, "cell": cls.HUCRESEL, "tarama": cls.TARAMA,
+            "genel tarama": cls.TARAMA, "spektrum": cls.TARAMA, "spectrum": cls.TARAMA, "general scan": cls.TARAMA,
+            "sistem": cls.SISTEM,
         }
-        return aliases.get(t)
+        return aliases.get(raw)
 
+
+def t_en(key: str) -> str:
+    from .i18n import EN
+    return EN.get(key, key)
+
+
+# Legacy Turkish category names written to the database by early versions.
+LEGACY_TR_NAMES = {
+    Category.HAVACILIK: "Havacılık", Category.DENIZCILIK: "Denizcilik", Category.UYDU: "Uydu",
+    Category.METEOROLOJI: "Meteoroloji", Category.AMATOR: "Amatör Telsiz", Category.ISM: "ISM/Sensör",
+    Category.ACIL: "Acil Durum", Category.HUCRESEL: "Hücresel", Category.TARAMA: "Genel Tarama",
+    Category.SISTEM: "Sistem",
+}
+LEGACY_TR_TO_KEY = {v: k.value for k, v in LEGACY_TR_NAMES.items()}
 
 CATEGORY_EMOJI = {
-    Category.HAVACILIK: "✈️",
-    Category.DENIZCILIK: "🚢",
-    Category.UYDU: "🛰️",
-    Category.METEOROLOJI: "🎈",
-    Category.AMATOR: "📻",
-    Category.ISM: "📡",
-    Category.ACIL: "🚨",
-    Category.HUCRESEL: "📶",
-    Category.TARAMA: "🔭",
-    Category.SISTEM: "⚙️",
+    Category.HAVACILIK: "✈️", Category.DENIZCILIK: "🚢", Category.UYDU: "🛰️", Category.METEOROLOJI: "🎈",
+    Category.AMATOR: "📻", Category.ISM: "📡", Category.ACIL: "🚨", Category.HUCRESEL: "📶",
+    Category.TARAMA: "🔭", Category.SISTEM: "⚙️",
 }
 
-# Öncelik sabitleri (küçük = önce gönderilir)
+# Priority constants (lower = sent first)
 PRIO_EMERGENCY = 0
 PRIO_HIGH = 1
 PRIO_IMPORTANT = 2
@@ -74,12 +100,12 @@ PRIO_LOW = 7
 
 
 def esc(text: Any) -> str:
-    """Telegram HTML için kaçış."""
+    """Escape for Telegram HTML."""
     return html.escape("" if text is None else str(text), quote=False)
 
 
 def fmt_freq(freq_mhz: float | None) -> str:
-    """Frekansı MHz olarak biçimler (uygulama boyunca MHz tutarlı). En az 3 ondalık."""
+    """Format a frequency in MHz with at least 3 decimals (131.725 MHz)."""
     if freq_mhz is None:
         return "—"
     s = f"{freq_mhz:.4f}".rstrip("0")
@@ -94,13 +120,14 @@ def fmt_duration(seconds: float | None) -> str:
     if seconds is None:
         return "—"
     seconds = float(seconds)
+    u_s, u_m, u_h = t("unit.s"), t("unit.min"), t("unit.h")
     if seconds < 60:
-        return f"{seconds:.0f} sn" if seconds >= 10 else f"{seconds:.1f} sn"
+        return f"{seconds:.0f} {u_s}" if seconds >= 10 else f"{seconds:.1f} {u_s}"
     m, s = divmod(int(round(seconds)), 60)
     if m < 60:
-        return f"{m} dk {s:02d} sn"
+        return f"{m} {u_m} {s:02d} {u_s}"
     h, m = divmod(m, 60)
-    return f"{h} sa {m:02d} dk"
+    return f"{h} {u_h} {m:02d} {u_m}"
 
 
 def fmt_time(dt: datetime, tz: ZoneInfo) -> str:
@@ -130,11 +157,11 @@ class Event:
     band: str = "—"
     freq_mhz: float | None = None
     summary: str = ""
-    body: str = ""                     # HTML (dinamik alanlar esc() ile kaçışlanmış olmalı)
+    body: str = ""                     # HTML (dynamic values must be escaped with esc())
     time_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     duration_s: float | None = None
-    signal: str | None = None          # biçimlenmiş metin ("-32.1 dBFS (SNR 18 dB)")
-    signal_value: float | None = None  # sıralama için sayısal değer (dB)
+    signal: str | None = None          # formatted text ("-32.1 dBFS (SNR 18 dB)")
+    signal_value: float | None = None  # numeric value for ranking (dB)
     lat: float | None = None
     lon: float | None = None
     location_text: str | None = None
@@ -144,7 +171,7 @@ class Event:
     transcript: str | None = None
     transcript_lang: str | None = None
     transcript_status: str = "none"   # none | pending | done | failed | empty
-    transcription_language: str | None = None   # hedefe özel dil zorlaması (tr/en)
+    transcription_language: str | None = None   # per-target forced language (tr/en)
     transcription_prompt: str | None = None
     reply_to: dict | None = None       # {"chat_id":..,"message_thread_id":..,"message_id":..}
     extra: dict = field(default_factory=dict)
@@ -152,7 +179,7 @@ class Event:
     db_id: int | None = None
     silent: bool | None = None
 
-    # ----- biçimlendirme -----
+    # ----- formatting -----
     @property
     def emoji(self) -> str:
         return CATEGORY_EMOJI.get(self.category, "•")
@@ -166,16 +193,20 @@ class Event:
 
     def header_html(self, tz: ZoneInfo, station_lat: float | None, station_lon: float | None) -> str:
         loc = self.location_text or format_location(self.lat, self.lon, station_lat, station_lon)
-        lines = [
-            f"{self.emoji} <b>{esc(self.event_type)}</b> • <b>{esc(self.category.value)}</b>",
-            f"├ Frekans aralığı : {esc(self.band or '—')}",
-            f"├ Yakalanan frekans: {esc(fmt_freq(self.freq_mhz))}",
-            f"├ Zaman           : {esc(fmt_time(self.time_utc, tz))}",
-            f"├ Süre            : {esc(fmt_duration(self.duration_s))}",
-            f"├ Sinyal gücü     : {esc(self.signal or '—')}",
-            f"├ Konum           : {esc(loc)}",
-            f"└ Özet            : {esc(self.first_line_summary() or '—')}",
+        rows = [
+            (t("hdr.band"), self.band or "—"),
+            (t("hdr.freq"), fmt_freq(self.freq_mhz)),
+            (t("hdr.time"), fmt_time(self.time_utc, tz)),
+            (t("hdr.duration"), fmt_duration(self.duration_s)),
+            (t("hdr.signal"), self.signal or "—"),
+            (t("hdr.location"), loc),
+            (t("hdr.summary"), self.first_line_summary() or "—"),
         ]
+        width = max(len(label) for label, _ in rows)
+        lines = [f"{self.emoji} <b>{esc(self.event_type)}</b> • <b>{esc(self.category.label)}</b>"]
+        for i, (label, value) in enumerate(rows):
+            branch = "└" if i == len(rows) - 1 else "├"
+            lines.append(f"{branch} {esc(label.ljust(width))} : {esc(value)}")
         return "\n".join(lines)
 
     def body_html(self) -> str:
@@ -184,9 +215,9 @@ class Event:
             parts.append(self.body)
         if self.transcript_status == "done" and self.transcript:
             lang = f" ({esc(self.transcript_lang)})" if self.transcript_lang else ""
-            parts.append(f"📝 <b>Transkripsiyon</b>{lang}:\n<i>{esc(self.transcript.strip())}</i>")
+            parts.append(f"📝 <b>{esc(t('body.transcript'))}</b>{lang}:\n<i>{esc(self.transcript.strip())}</i>")
         elif self.transcript_status in ("failed", "empty"):
-            parts.append("📝 <i>Ses alındı, metin çıkarılamadı.</i>")
+            parts.append(f"📝 <i>{esc(t('body.transcript_failed'))}</i>")
         return "\n\n".join(parts)
 
     def to_html(self, tz: ZoneInfo, station_lat: float | None, station_lon: float | None) -> str:
@@ -194,7 +225,7 @@ class Event:
         body = self.body_html()
         return header + ("\n\n" + body if body else "")
 
-    # ----- serileştirme -----
+    # ----- serialization -----
     def to_dict(self) -> dict:
         d = asdict(self)
         d["category"] = self.category.value
@@ -205,7 +236,8 @@ class Event:
     @classmethod
     def from_dict(cls, d: dict) -> "Event":
         d = dict(d)
-        d["category"] = Category(d["category"])
+        cat = d["category"]
+        d["category"] = Category(LEGACY_TR_TO_KEY.get(cat, cat))
         d["time_utc"] = datetime.fromisoformat(d["time_utc"])
         d["attachments"] = [Attachment(**a) for a in d.get("attachments", [])]
         return cls(**d)

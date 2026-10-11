@@ -19,7 +19,7 @@ def test_event_insert_and_count():
     now = time.time()
     assert st.events_count(now - 10, now + 10) == 1
     cats = st.count_by("category", now - 10, now + 10)
-    assert cats and cats[0][0] == "Havacılık"
+    assert cats and cats[0][0] == "aviation"  # language-neutral key
 
 
 def test_queue_fifo_priority():

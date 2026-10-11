@@ -1,8 +1,8 @@
-"""SQLite tabanlı kalıcı depolama: olaylar, gönderim kuyruğu, cihaz kayıt defteri,
-ses kayıtları, hedef çalışma geçmişi ve hata günlüğü.
+"""SQLite persistence: events, send queue, device registry, recordings,
+target run history and error log.
 
-Tek bağlantı + kilit ile iş parçacığı güvenlidir (hem asyncio döngüsü hem de
-tarayıcı iş parçacıkları kullanır).
+A single connection guarded by a lock makes it safe for the worker threads
+(dispatcher, scheduler, targets) that all write concurrently.
 """
 from __future__ import annotations
 
@@ -111,6 +111,20 @@ class Storage:
         with self._lock:
             self._conn.close()
 
+    def migrate_categories(self, mapping: dict[str, str]) -> int:
+        """Rewrite legacy (Turkish) category names to language-neutral keys."""
+        n = 0
+        with self._lock:
+            for old, new in mapping.items():
+                cur = self._conn.execute("UPDATE events SET category=? WHERE category=?", (new, old))
+                n += cur.rowcount or 0
+            self._conn.commit()
+        muted = self.kv_get("muted_categories", [])
+        if isinstance(muted, list) and any(m in mapping for m in muted):
+            self.kv_set("muted_categories", [mapping.get(m, m) for m in muted])
+            n += 1
+        return n
+
     def _exec(self, sql: str, params: Iterable = ()) -> sqlite3.Cursor:
         with self._lock:
             cur = self._conn.execute(sql, tuple(params))
@@ -150,12 +164,12 @@ class Storage:
     def count_by(self, column: str, t0: float, t1: float) -> list[tuple[str, int]]:
         assert column in ("category", "target", "event_type")
         rows = self._query(f"SELECT {column} AS k, COUNT(*) AS n FROM events WHERE ts>=? AND ts<? "
-                           f"AND category!='Sistem' GROUP BY {column} ORDER BY n DESC", (t0, t1))
+                           f"AND category!='system' GROUP BY {column} ORDER BY n DESC", (t0, t1))
         return [(r["k"] or "—", r["n"]) for r in rows]
 
     def top_events(self, t0: float, t1: float, n: int = 5) -> list[sqlite3.Row]:
         return self._query(
-            "SELECT * FROM events WHERE ts>=? AND ts<? AND category!='Sistem' "
+            "SELECT * FROM events WHERE ts>=? AND ts<? AND category!='system' "
             "ORDER BY priority ASC, COALESCE(signal_value,-999) DESC, ts DESC LIMIT ?", (t0, t1, n))
 
     def audio_total_s(self, t0: float, t1: float) -> float:
@@ -167,7 +181,7 @@ class Storage:
         return int(rows[0]["s"] or 0)
 
     def events_count(self, t0: float, t1: float) -> int:
-        rows = self._query("SELECT COUNT(*) AS n FROM events WHERE ts>=? AND ts<? AND category!='Sistem'", (t0, t1))
+        rows = self._query("SELECT COUNT(*) AS n FROM events WHERE ts>=? AND ts<? AND category!='system'", (t0, t1))
         return int(rows[0]["n"])
 
     # ------------------------------------------------------------------- queue
@@ -177,7 +191,7 @@ class Storage:
         return int(cur.lastrowid)
 
     def queue_pop(self) -> tuple[int, Event, int] | None:
-        """Gönderilmeye hazır en öncelikli ögeyi döndürür (id, event, attempts) — silmez."""
+        """Return the highest-priority item ready to send as (id, event, attempts) without removing it."""
         now = time.time()
         rows = self._query("SELECT id, event_json, attempts FROM queue WHERE next_try<=? "
                            "ORDER BY priority ASC, ts ASC LIMIT 1", (now,))
@@ -207,7 +221,7 @@ class Storage:
 
     # ---------------------------------------------------------------- registry
     def registry_touch(self, kind: str, key: str, data: dict | None = None) -> tuple[bool, float, int]:
-        """Kaydı günceller/oluşturur. (yeni_mi, ilk_görülme, sayaç) döndürür."""
+        """Create or update a registry row; returns (is_new, first_seen, count)."""
         now = time.time()
         with self._lock:
             row = self._conn.execute("SELECT first_seen, count, data FROM registry WHERE kind=? AND key=?",
@@ -309,18 +323,43 @@ class Storage:
                    (key, json.dumps(value, ensure_ascii=False, default=str)))
 
     # ----------------------------------------------------------------- cleanup
-    def cleanup(self, retention_days: int) -> tuple[int, list[str]]:
-        """Eski kayıtları siler; silinecek dosya yollarını döndürür."""
+    def cleanup(self, retention_days: int, registry_multiplier: int = 3) -> tuple[int, list[str]]:
+        """Circular retention: delete rows older than `retention_days`.
+
+        Returns (count, file paths) of recordings to remove from disk. The device/
+        aircraft/vessel registry is kept `registry_multiplier` times longer so that
+        "new device" notifications are not repeated after each cleanup."""
         cutoff = time.time() - retention_days * 86400
         rows = self._query("SELECT path FROM recordings WHERE ts<?", (cutoff,))
         paths = [r["path"] for r in rows if r["path"]]
         self._exec("DELETE FROM recordings WHERE ts<?", (cutoff,))
-        self._exec("DELETE FROM events WHERE ts<?", (cutoff - 76 * 86400,))
+        self._exec("DELETE FROM events WHERE ts<?", (cutoff,))
         self._exec("DELETE FROM target_runs WHERE started<?", (cutoff,))
         self._exec("DELETE FROM errors WHERE ts<?", (cutoff,))
         self._exec("DELETE FROM queue WHERE attempts>=20")
-        # kayıt defteri: 90 gündür görülmeyen uçak/gemi/cihaz/istasyon kayıtları
+        reg_cutoff = time.time() - retention_days * max(1, registry_multiplier) * 86400
         self._exec("DELETE FROM registry WHERE last_seen<? AND kind IN "
-                   "('aircraft','ship','ism_device','aprs_station','acars_ac','vdl2_ac','spectrum_anom','sonde_carrier')",
-                   (time.time() - 90 * 86400,))
+                   "('aircraft','ship','ism_device','aprs_station','acars_ac','vdl2_ac',"
+                   "'spectrum_anom','sonde_carrier','adsb_emerg','ais_sart','gsm_cell','sonde')",
+                   (reg_cutoff,))
         return len(paths), paths
+
+    def vacuum(self) -> None:
+        """Reclaim disk space after deletions and truncate the WAL file."""
+        with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self._conn.execute("VACUUM")
+                self._conn.commit()
+            except sqlite3.Error:
+                pass
+
+    def db_size_bytes(self) -> int:
+        try:
+            total = self.path.stat().st_size
+            wal = self.path.with_name(self.path.name + "-wal")
+            if wal.exists():
+                total += wal.stat().st_size
+            return total
+        except OSError:
+            return 0

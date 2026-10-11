@@ -1,12 +1,12 @@
-"""Hedef 14 — ISS (Uluslararası Uzay İstasyonu, 145.800/145.825 MHz).
+"""Target 14 — ISS (International Space Station, 145.800/145.825 MHz).
 
-Geçiş penceresinde (TLE'den hesaplanır) seçilen kipte çalışır:
-  - voice (varsayılan): 145.800 MHz FM ses kaydı → ses + transkripsiyon.
-  - sstv: 145.800 MHz FM kaydı + SSTV çözümü (harici çözücü komutu tanımlıysa).
-  - aprs: 145.825 MHz FM paket (ISS dijipiter) → multimon-ng/aprslib.
+During the TLE-computed pass window the selected mode runs:
+  - voice (default): 145.800 MHz FM recording -> audio + transcript.
+  - sstv: 145.800 MHz FM recording + SSTV decoding (if an external decoder is configured).
+  - aprs: 145.825 MHz FM packets (ISS digipeater) -> multimon-ng/aprslib.
 
-ISS sesi/SSTV'si yalnızca etkinlik zamanlarında yayınlanır; geçişte sinyal yoksa
-kısa "geçiş dinlendi, yayın yok" notu üretilir.
+ISS voice/SSTV is only transmitted during events; a pass without a signal
+produces a short "pass monitored, no transmission" note.
 """
 from __future__ import annotations
 
@@ -17,11 +17,14 @@ import time
 from pathlib import Path
 
 from ..events import Category, Attachment
+from ..i18n import t
+from ..proc import shell_pipeline
 from .base import TargetBase, audio_attachment
 
 
 class ISSTarget(TargetBase):
-    NAME = "ISS"
+    NAME_KEY = "iss.name"
+    BAND_KEY = "iss.band"
     CATEGORY = Category.UYDU
     CLASS = "pass"
     DEFAULTS = {
@@ -29,7 +32,7 @@ class ISSTarget(TargetBase):
         "norad": 25544, "min_elevation": 15, "lookahead_h": 12,
         "mode": "voice", "voice_freq_mhz": 145.800, "aprs_freq_mhz": 145.825,
         "gain": "auto", "threshold_dbfs": -42.0, "transcribe_language": "en",
-        "sstv_decoder_cmd": "", "band_label": "145.800/145.825 MHz ISS",
+        "sstv_decoder_cmd": "",
     }
 
     def __init__(self, key, ctx):
@@ -38,7 +41,7 @@ class ISSTarget(TargetBase):
 
     def tools_available(self):
         ok = self.sdr.bin_rtl_fm is not None
-        return ok, ("" if ok else "rtl_fm yok")
+        return ok, ("" if ok else "rtl_fm not found")
 
     def next_window(self, now: float):
         c = getattr(self, "_winc", None)
@@ -69,7 +72,7 @@ class ISSTarget(TargetBase):
             if not p:
                 return
         mode = self.conf.get("mode", "voice")
-        self.log.info("ISS geçişi: max %.0f° irtifa, %.0f sn, kip=%s", p.max_elevation, p.duration_s, mode)
+        self.log.info("ISS pass: max elevation %.0f°, %.0f s, mode=%s", p.max_elevation, p.duration_s, mode)
         if mode == "aprs":
             self._run_aprs(stop_event, duration_s, p)
         else:
@@ -88,18 +91,18 @@ class ISSTarget(TargetBase):
             self._no_signal(p)
             return
         for seg in segs:
-            atts = [audio_attachment(seg.final_path, caption="ISS 145.800 MHz")]
+            atts = [audio_attachment(seg.final_path, caption=t("iss.caption"))]
             images = self._try_sstv(seg.final_path) if sstv else []
             for img in images:
-                atts.append(Attachment("photo", img, caption="ISS SSTV"))
+                atts.append(Attachment("photo", img, caption=t("iss.sstv_caption")))
             rec_id = self.st.add_recording(seg.start_utc.timestamp(), self.KEY, 145.800, "ISS",
                                            seg.duration_s, seg.final_path, f"{seg.peak_dbfs:.1f} dBFS", None)
             ev = self.make_event(
-                "ISS SSTV/Ses" if sstv else "ISS Ses",
-                summary=f"ISS geçişi — {seg.duration_s:.0f} sn yayın (max {p.max_elevation:.0f}°)"
-                        + (f", {len(images)} SSTV görüntüsü" if images else ""),
-                body=f"Maks. irtifa: {p.max_elevation:.0f}°\nTepe seviye : {seg.peak_dbfs:.1f} dBFS",
-                freq_mhz=145.800, signal=f"{seg.peak_dbfs:.1f} dBFS (tepe)", signal_value=seg.peak_dbfs,
+                t("evt.iss_sstv") if sstv else t("evt.iss_voice"),
+                summary=t("iss.summary", s=f"{seg.duration_s:.0f}", el=f"{p.max_elevation:.0f}")
+                        + (t("iss.sstv_count", n=len(images)) if images else ""),
+                body=f"{t('iss.max_el')}: {p.max_elevation:.0f}°\n{t('iss.peak')}: {seg.peak_dbfs:.1f} dBFS",
+                freq_mhz=145.800, signal=t("common.peak_dbfs", v=f"{seg.peak_dbfs:.1f}"), signal_value=seg.peak_dbfs,
                 duration_s=seg.duration_s, attachments=atts, priority=self.priority, time_utc=seg.start_utc)
             ev.transcript_status = "pending"
             ev.transcription_language = self.conf.get("transcribe_language", "en")
@@ -117,7 +120,7 @@ class ISSTarget(TargetBase):
             import subprocess
             subprocess.run(cmd, shell=True, timeout=120, capture_output=True)
         except (subprocess.SubprocessError, OSError) as e:
-            self.log.warning("SSTV çözücü hatası: %s", e)
+            self.log.warning("SSTV decoder error: %s", e)
             return []
         imgs = []
         dst_dir = self.cfg.recordings_dir / "sstv"
@@ -152,19 +155,18 @@ class ISSTarget(TargetBase):
                 count["n"] += 1
                 frame = line.split("APRS:", 1)[1].strip()
                 src = frame.split(">")[0] if ">" in frame else "?"
-                ev = self.make_event("ISS Paket", summary=f"ISS dijipiter paketi: {src}",
+                ev = self.make_event(t("evt.iss_packet"), summary=t("iss.packet_summary", src=src),
                                      body=f"<code>{frame[:200]}</code>", freq_mhz=145.825,
                                      priority=self.priority)
                 self.emit(ev)
-        self.run_tool_lines(["bash", "-c", pipeline], stop_event, duration_s, on_line,
+        self.run_tool_lines(shell_pipeline(pipeline), stop_event, duration_s, on_line,
                             name="iss-aprs", log_name="iss")
         if count["n"] == 0:
             self._no_signal(p)
 
     def _no_signal(self, p):
         ev = self.make_event(
-            "ISS Geçiş", summary=f"ISS geçişi dinlendi, yayın yok (max {p.max_elevation:.0f}°)",
-            body=("ISS geçişi penceresi dinlendi ancak sinyal yakalanmadı. ISS sesi/SSTV'si "
-                  "yalnızca planlı etkinliklerde yayınlanır."),
+            t("evt.iss_pass"), summary=t("iss.no_signal_summary", el=f"{p.max_elevation:.0f}"),
+            body=t("iss.no_signal_body"),
             freq_mhz=145.800, priority=6, time_utc=p.rise, duration_s=p.duration_s)
         self.emit(ev)

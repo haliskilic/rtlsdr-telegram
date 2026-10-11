@@ -1,4 +1,4 @@
-"""Döner dosya + konsol loglaması."""
+"""Rotating file + console logging."""
 from __future__ import annotations
 
 import logging
@@ -19,7 +19,7 @@ def setup_logging(log_dir: Path, level: str = "INFO") -> logging.Logger:
     ch = logging.StreamHandler()
     ch.setFormatter(fmt)
     logger.addHandler(ch)
-    # hata ayrı dosya
+    # errors in a separate file
     eh = logging.handlers.RotatingFileHandler(log_dir / "errors.log", maxBytes=2_000_000,
                                               backupCount=3, encoding="utf-8")
     eh.setFormatter(fmt)

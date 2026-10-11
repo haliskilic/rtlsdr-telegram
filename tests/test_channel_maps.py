@@ -1,8 +1,13 @@
 from rtlsdr_telegram.channel_maps import channel_name, describe, MARINE, PMR446, CB
+from rtlsdr_telegram.i18n import set_language
 
 
-def test_marine_ch16():
-    assert "16" in (channel_name(156.800, "marine") or "")
+def test_marine_ch16_bilingual():
+    set_language("en")
+    assert channel_name(156.800, "marine") == "Channel 16 (Distress/Calling)"
+    set_language("tr")
+    assert channel_name(156.800, "marine") == "Kanal 16 (Acil/Çağrı)"
+    set_language("en")
 
 
 def test_pmr_channel():

@@ -1,7 +1,7 @@
-"""İzlenecek 16 hedef + spektrum gözcüsü. Her hedef ayrı bir modül/sınıftır.
+"""The 16 monitoring targets. Each target is its own module/class.
 
-`ALL_TARGETS` kayıt sırası, `build_targets(ctx)` ise yapılandırmaya göre etkin
-hedef nesnelerini üretir.
+`DEFAULT_ORDER` is the registration order; `build_targets(ctx)` instantiates
+the targets according to the configuration.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from .iss import ISSTarget
 from .inmarsat import InmarsatTarget
 from .spectrum import SpectrumTarget
 
-# config.targets anahtarı -> sınıf
+# config.targets key -> class
 TARGET_CLASSES = {
     "adsb": ADSBTarget,
     "acars": ACARSTarget,
@@ -40,17 +40,17 @@ TARGET_CLASSES = {
     "spectrum": SpectrumTarget,
 }
 
-# Varsayılan tarama/öncelik sırası (config'de yoksa bu sırayla kaydedilir)
+# default registration order (used when config.targets does not list a key)
 DEFAULT_ORDER = list(TARGET_CLASSES.keys())
 
 
 def build_targets(ctx: "TargetContext") -> list[TargetBase]:
-    """Yapılandırmadaki (veya varsayılan) sıraya göre etkin hedefleri üretir."""
+    """Instantiate targets in configuration (or default) order."""
     targets = []
     for key, cls in TARGET_CLASSES.items():
         cls.register_defaults(ctx.cfg, key)
     keys = ctx.cfg.target_keys() or DEFAULT_ORDER
-    # bilinen tüm anahtarları kapsa (config'de eksik olsa da varsayılanla)
+    # cover every known key (defaults apply when missing from config)
     seen = set()
     ordered = [k for k in keys if k in TARGET_CLASSES] + [k for k in DEFAULT_ORDER if k not in keys]
     for key in ordered:

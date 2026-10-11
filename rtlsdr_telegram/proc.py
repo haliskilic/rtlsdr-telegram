@@ -1,7 +1,8 @@
-"""Alt süreç (subprocess) yönetimi için ortak yardımcılar.
+"""Shared helpers for subprocess management.
 
-Harici araçları (rtl_fm, rtl_433, dump1090/readsb, direwolf, satdump ...) başlatıp
-satır satır çıktı okuyan, çökerse kontrollü kapanan, log dosyasına yazan sınıf.
+ManagedProcess starts external tools (rtl_fm, rtl_433, readsb, direwolf, satdump ...),
+streams their output line by line (or as binary chunks), writes stderr to a
+rotating per-tool log and shuts the whole process group down cleanly.
 """
 from __future__ import annotations
 
@@ -16,6 +17,32 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 
+# Per-tool log rotation (adsb.log, aiscatcher.log ...). The Application sets these
+# from config at startup; defaults keep logs bounded even without configuration.
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUPS = 2
+
+
+def rotate_log(path: Path, max_bytes: int | None = None, backups: int | None = None) -> None:
+    """Rotate `path` -> `path.1` -> `path.2` ... when it exceeds max_bytes."""
+    max_bytes = LOG_MAX_BYTES if max_bytes is None else max_bytes
+    backups = LOG_BACKUPS if backups is None else backups
+    try:
+        if not path.exists() or path.stat().st_size < max_bytes:
+            return
+        for i in range(backups, 0, -1):
+            src = path if i == 1 else path.with_name(f"{path.name}.{i - 1}")
+            dst = path.with_name(f"{path.name}.{i}")
+            if src.exists():
+                if dst.exists():
+                    dst.unlink()
+                src.rename(dst)
+        if backups <= 0:
+            path.unlink()
+    except OSError:
+        pass
+
+
 def which(*names: str) -> str | None:
     import shutil
     for n in names:
@@ -28,10 +55,11 @@ def which(*names: str) -> str | None:
 
 
 class ManagedProcess:
-    """Bir alt süreci başlatır; stdout satırlarını bir geri çağırmaya iletir.
+    """Start a subprocess and forward stdout lines to a callback.
 
-    `stderr` ayrı iş parçacığında log dosyasına yazılır. `stop()` önce SIGTERM,
-    sonra SIGKILL dener; süreç grubu (setsid) ile çocuk süreçler de temizlenir.
+    stderr is written to the log file by a separate thread. `stop()` sends
+    SIGTERM, then SIGKILL; the process group (setsid) is killed so pipeline
+    children die as well.
     """
 
     def __init__(self, cmd: list[str], *, name: str = "", on_line: Callable[[str], None] | None = None,
@@ -50,10 +78,10 @@ class ManagedProcess:
         self._stop = threading.Event()
         self.started_at = 0.0
         self._logfh = None
-        # ikili (binary) stdout için zaman aşımılı okuma kuyruğu
+        # timed read queue for binary stdout
         self._bin_q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=256)
         self._bin_chunk = 4096
-        # son stderr satırları (cihaz açma hatası tespiti için)
+        # last stderr lines (device-open error detection)
         self.stderr_tail: "collections.deque[str]" = collections.deque(maxlen=30)
 
     def start(self) -> None:
@@ -63,6 +91,7 @@ class ManagedProcess:
             creation["start_new_session"] = True
         if self.log_path:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            rotate_log(self.log_path)
             self._logfh = open(self.log_path, "a", encoding="utf-8", errors="replace")
             self._logfh.write(f"\n===== {self.name} start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
             self._logfh.write("CMD: " + " ".join(self.cmd) + "\n")
@@ -123,7 +152,7 @@ class ManagedProcess:
             pass
 
     def _pump_binary(self) -> None:
-        """İkili stdout'u parçalar halinde kuyruğa akıtır (okuyucu bloklanmasın)."""
+        """Pump binary stdout into the queue in chunks so readers never block."""
         assert self.proc and self.proc.stdout
         try:
             while not self._stop.is_set():
@@ -133,7 +162,7 @@ class ManagedProcess:
                 try:
                     self._bin_q.put(chunk, timeout=2)
                 except queue.Full:
-                    # tüketici yavaş; en eskiyi at (gerçek zamanlı ses için kabul edilebilir)
+                    # consumer is slow; drop the oldest chunk (acceptable for live audio)
                     try:
                         self._bin_q.get_nowait()
                     except queue.Empty:
@@ -142,15 +171,15 @@ class ManagedProcess:
             pass
         finally:
             try:
-                self._bin_q.put_nowait(None)  # EOF işareti
+                self._bin_q.put_nowait(None)  # EOF marker
             except queue.Full:
                 pass
 
     def read_stdout_bytes(self, size: int, timeout: float = 0.5) -> bytes | None:
-        """İkili stdout'tan en fazla `size` bayt okur; `timeout` içinde veri yoksa None.
+        """Read up to `size` bytes from binary stdout; None when nothing arrives within `timeout`.
 
-        Süreç sustuğunda (örn. squelch kapalıyken rtl_fm) çağıran bloklanmaz;
-        None 'veri yok' demektir, b'' ise EOF (süreç bitti)."""
+        The caller never blocks when the process goes quiet (e.g. rtl_fm with the
+        squelch closed): None means "no data", b"" means EOF (process ended)."""
         buf = bytearray()
         deadline = time.time() + timeout
         while len(buf) < size:
@@ -228,7 +257,7 @@ DEVICE_ERROR_MARKERS = ("usb_claim_interface", "Failed to open rtlsdr device", "
 
 
 def looks_like_device_error(lines: Iterable[str]) -> bool:
-    """stderr satırlarında dongle açılamadı/meşgul belirtisi var mı?"""
+    """Do the stderr lines indicate that the dongle could not be opened / is busy?"""
     for ln in lines:
         for m in DEVICE_ERROR_MARKERS:
             if m in ln:
@@ -237,14 +266,14 @@ def looks_like_device_error(lines: Iterable[str]) -> bool:
 
 
 def shell_pipeline(pipeline: str) -> list[str]:
-    """Boru içeren bir komut dizgesini platforma uygun kabukla çalıştırmak için argv üretir."""
+    """argv that runs a shell pipeline string with the platform shell."""
     if os.name == "nt":
         return ["cmd", "/c", pipeline]
     return ["bash", "-c", pipeline]
 
 
 def run_capture(cmd: Iterable[str], timeout: float = 30, env: dict | None = None) -> tuple[int, str, str]:
-    """Kısa ömürlü komutu çalıştırıp (rc, stdout, stderr) döndürür."""
+    """Run a short-lived command and return (rc, stdout, stderr)."""
     def _dec(x):
         if x is None:
             return ""
@@ -254,8 +283,8 @@ def run_capture(cmd: Iterable[str], timeout: float = 30, env: dict | None = None
                           env={**os.environ, **(env or {})})
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired as e:
-        return 124, _dec(e.stdout), _dec(e.stderr) + "\n[zaman aşımı]"
+        return 124, _dec(e.stdout), _dec(e.stderr) + "\n[timeout]"
     except FileNotFoundError:
-        return 127, "", "komut bulunamadı"
+        return 127, "", "command not found"
     except OSError as e:
         return 1, "", str(e)

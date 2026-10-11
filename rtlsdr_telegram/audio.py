@@ -1,13 +1,11 @@
-"""Eşik tetiklemeli ses kaydı (madde 2, ses üreten hedefler; madde 3).
+"""Threshold-triggered audio recording (spec sections 2 and 3).
 
-rtl_fm'den s16le PCM akışını okur, kendi VOX (ses varlığı) algılamasını yapar:
-seviye eşiği aşılınca segment başlar, sessizlik `hangover_s` kadar sürünce
-segment kapanır ve dosyaya yazılır. Her segment için (yol, süre, tepe/ortalama
-seviye) döndürülür. rtl_fm'in squelch davranışından bağımsız çalışır.
-
-Kapanan her dosya ffmpeg ile ogg/opus'a (veya mp3) çevrilir; ham WAV isteğe bağlı
-tutulur. Dosya daha sonra Dispatcher tarafından gönderilir ve Transcriber ile
-yazıya dökülür.
+Reads the s16le PCM stream from rtl_fm and performs its own VOX detection: a
+segment opens when the level crosses the threshold and closes after
+`hangover_s` of silence. Flat-level segments (FM static / carriers) are
+rejected by the dynamics gate. Each closed segment is encoded to ogg/opus (or
+mp3) with ffmpeg; the raw WAV is optionally kept. The Dispatcher sends the file
+and the Transcriber turns it into text.
 """
 from __future__ import annotations
 
@@ -54,7 +52,7 @@ class Segment:
 
 
 class AudioRecorder:
-    """Verilen frekansta bir zaman penceresi boyunca etkinlik segmentlerini kaydeder."""
+    """Record activity segments on a frequency for a time window."""
 
     def __init__(self, cfg, sdr, logger):
         self.cfg = cfg
@@ -67,11 +65,30 @@ class AudioRecorder:
         self.keep_wav = bool(a.get("keep_wav", False))
         self.rec_dir = cfg.recordings_dir
         self.tmp_dir = cfg.data_dir / "tmp"
+        self.min_free_pct = float(cfg.get("paths.min_free_disk_pct", 10) or 0)
+        self._disk_warned = 0.0
         try:
             from zoneinfo import ZoneInfo
             self.tz = ZoneInfo(cfg.get("timezone", "Europe/Istanbul"))
         except Exception:
             self.tz = timezone.utc
+
+    def disk_ok(self) -> bool:
+        """False when free space is below paths.min_free_disk_pct (recording is skipped)."""
+        if self.min_free_pct <= 0:
+            return True
+        try:
+            import shutil
+            u = shutil.disk_usage(str(self.rec_dir))
+            free_pct = 100.0 * u.free / max(1, u.total)
+        except OSError:
+            return True
+        if free_pct < self.min_free_pct:
+            if time.time() - self._disk_warned > 3600:
+                self._disk_warned = time.time()
+                self.log.warning("disk nearly full (%.1f%% free) — recording skipped", free_pct)
+            return False
+        return True
 
     def record_window(self, freq_hz: int, duration_s: float, stop_event: threading.Event, *,
                       mode: str = "fm", audio_rate: int = 16000, threshold_dbfs: float = -45.0,
@@ -79,12 +96,15 @@ class AudioRecorder:
                       max_segment_s: float = 120.0, gain=None, squelch: int = 0,
                       channel: str | None = None, prefix: str = "rec",
                       require_dynamics: bool = True, min_dynamics_db: float = 2.5) -> list[Segment]:
-        """Pencere boyunca kayıt yapıp tamamlanan segmentleri döndürür."""
+        """Record for the window and return the completed segments."""
+        if not self.disk_ok():
+            stop_event.wait(min(duration_s, 5))
+            return []
         try:
             cmd = self.sdr.rtl_fm_cmd(freq_hz, mode=mode, sample_rate=audio_rate,
                                       resample=audio_rate, gain=gain, squelch=squelch)
         except Exception as e:
-            self.log.warning("rtl_fm komutu kurulamadı: %s", e)
+            self.log.warning("rtl_fm command could not be built: %s", e)
             return []
         proc = ManagedProcess(cmd, name=f"{prefix}-rtlfm", text_stdout=False,
                               log_path=self.cfg.log_dir / f"{prefix}_rtlfm.log")
@@ -96,11 +116,11 @@ class AudioRecorder:
         try:
             proc.start()
         except Exception as e:
-            self.log.warning("rtl_fm başlatılamadı: %s", e)
+            self.log.warning("rtl_fm failed to start: %s", e)
             return []
 
         bytes_per_s = audio_rate * 2
-        block_bytes = max(2, int(bytes_per_s * 0.1))  # ~100 ms blok
+        block_bytes = max(2, int(bytes_per_s * 0.1))  # ~100 ms block
         deadline = time.time() + duration_s
 
         active = False
@@ -115,9 +135,9 @@ class AudioRecorder:
         def finalize():
             nonlocal buf, peak, acc_lin, acc_n, active, levels
             dur = len(buf) / bytes_per_s
-            # Dinamik-aralık (dynamics) kapısı: FM statiği/taşıyıcısı düz seviyelidir;
-            # gerçek konuşma hecelerle dalgalanır. Seviye std sapması düşükse (düz),
-            # muhtemelen gürültü/taşıyıcıdır — reddet. (min_dynamics_db ile ayarlanır)
+            # Dynamics gate: FM static / a carrier has a flat level, real speech varies
+            # with syllables. A low standard deviation of the level means noise or a
+            # carrier -> reject. (tuned with min_dynamics_db)
             flat = False
             if require_dynamics and len(levels) >= 4:
                 m = sum(levels) / len(levels)
@@ -130,7 +150,7 @@ class AudioRecorder:
                 if seg:
                     segments.append(seg)
             elif flat:
-                self.log.debug("segment reddedildi (düz seviye, muhtemelen statik): std<%.1f dB", min_dynamics_db)
+                self.log.debug("segment rejected (flat level, probably static): std<%.1f dB", min_dynamics_db)
             buf = bytearray()
             peak = -120.0
             acc_lin = 0.0
@@ -143,9 +163,9 @@ class AudioRecorder:
                 block = proc.read_stdout_bytes(block_bytes, timeout=0.5)
                 now = time.time()
                 if block == b"":
-                    break  # EOF: rtl_fm bitti/çöktü
+                    break  # EOF: rtl_fm ended/crashed
                 if block is None:
-                    # Veri yok (squelch kapalı ya da duraklama): sessizlik olarak işle
+                    # no data (squelch closed or a pause): treat as silence
                     if active and now - last_voice >= hangover_s:
                         finalize()
                     if not proc.running:
@@ -169,9 +189,9 @@ class AudioRecorder:
                     if len(buf) / bytes_per_s >= max_segment_s:
                         finalize()
                 elif active:
-                    buf += block  # hangover sırasında da yaz
+                    buf += block  # keep writing during the hangover
                     if now - last_voice >= hangover_s:
-                        # kuyruk sessizliğini kırp
+                        # trim the trailing silence
                         tail = int(hangover_s * bytes_per_s)
                         if len(buf) > tail:
                             buf = buf[:-tail]
@@ -201,7 +221,7 @@ class AudioRecorder:
                 w.setframerate(rate)
                 w.writeframes(pcm)
         except (wave.Error, OSError) as e:
-            self.log.warning("WAV yazılamadı: %s", e)
+            self.log.warning("WAV write failed: %s", e)
             return None
         seg = Segment(str(wav_path), start_dt, dur, peak, mean, freq_hz, channel=channel)
         final = self._encode(wav_path, base)
@@ -214,7 +234,7 @@ class AudioRecorder:
         return seg
 
     def _encode(self, wav_path: Path, base: str) -> str | None:
-        """WAV'ı hedef formata çevirir; ffmpeg yoksa WAV döndürür."""
+        """Encode the WAV to the target format; without ffmpeg return the WAV."""
         if self.out_format == "wav":
             dst = self.rec_dir / f"{base}.wav"
             try:
@@ -238,8 +258,8 @@ class AudioRecorder:
             subprocess.run(cmd, check=True, timeout=120, capture_output=True)
             return str(dst)
         except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
-            self.log.warning("ses kodlama hatası (%s), WAV kullanılacak: %s", self.out_format, e)
-            # WAV'ı kayıt klasörüne taşı
+            self.log.warning("audio encoding failed (%s), using WAV: %s", self.out_format, e)
+            # move the WAV to the recordings folder
             try:
                 fallback = self.rec_dir / f"{base}.wav"
                 import shutil

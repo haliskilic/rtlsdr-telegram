@@ -1,16 +1,16 @@
-"""Ses kayıtlarının otomatik yazıya dökülmesi (Özellik A, madde 4).
+"""Automatic transcription of audio recordings (feature A, spec section 4).
 
-Motor yapılandırmadan seçilir:
-  - faster_whisper (varsayılan): yerel, CTranslate2 tabanlı, CPU'da hızlı.
-  - whisper: openai-whisper paketi (yerel, daha ağır).
-  - api: OpenAI uyumlu /audio/transcriptions uç noktası.
-  - none: transkripsiyon kapalı.
+The engine is selected in the configuration:
+  - faster_whisper (default): local, CTranslate2 based, fast on CPU.
+  - whisper: the openai-whisper package (local, heavier).
+  - api: an OpenAI-compatible /audio/transcriptions endpoint.
+  - none: transcription disabled.
 
-Dil otomatik algılanır (auto) veya hedefe göre zorlanır (tr/en). Havacılık ve
-denizcilik için İngilizce + terim listesi ipucu (initial_prompt) verilebilir.
+The language is auto-detected or forced per target (tr/en). Aviation and
+maritime targets can use an English vocabulary hint (initial_prompt).
 
-Bu modül ağır modeli yalnızca ilk kullanımda (lazy) yükler; model yoksa veya
-yükleme başarısızsa düzgünce "none" davranışına düşer.
+The heavy model is loaded lazily on first use; when it is missing or fails to
+load the module degrades gracefully to "none".
 """
 from __future__ import annotations
 
@@ -36,23 +36,23 @@ class Transcriber:
     def __init__(self, cfg, logger):
         self.cfg = cfg
         self.log = logger
-        t = cfg.section("transcription")
-        self.engine = (t.get("engine") or "none").lower()
-        self.model_name = t.get("model", "base")
-        self.device = t.get("device", "cpu")
-        self.compute_type = t.get("compute_type", "int8")
-        self.language = (t.get("language") or "auto").lower()
-        self.timeout_s = int(t.get("timeout_s", 300))
-        self.vad = bool(t.get("vad", True))
-        self.beam_size = int(t.get("beam_size", 1))
-        self.prompts = t.get("prompts", {}) or {}
-        self.api = t.get("api", {}) or {}
+        tc = cfg.section("transcription")
+        self.engine = (tc.get("engine") or "none").lower()
+        self.model_name = tc.get("model", "base")
+        self.device = tc.get("device", "cpu")
+        self.compute_type = tc.get("compute_type", "int8")
+        self.language = (tc.get("language") or "auto").lower()
+        self.timeout_s = int(tc.get("timeout_s", 300))
+        self.vad = bool(tc.get("vad", True))
+        self.beam_size = int(tc.get("beam_size", 1))
+        self.prompts = tc.get("prompts", {}) or {}
+        self.api = tc.get("api", {}) or {}
         self.ffmpeg = cfg.get("audio.ffmpeg", "ffmpeg")
         self._model = None
         self._model_failed = False
         self.available = self.engine not in ("none", "")
 
-    # -------------------------------------------------- model yükleme (lazy)
+    # -------------------------------------------------- model loading (lazy)
     def _load_local(self) -> bool:
         if self._model is not None:
             return True
@@ -68,16 +68,16 @@ class Transcriber:
             else:
                 self._model_failed = True
                 return False
-            self.log.info("transcription: '%s' modeli yüklendi (%s)", self.model_name, self.engine)
+            self.log.info("transcription: model '%s' loaded (%s)", self.model_name, self.engine)
             return True
-        except Exception as e:  # model indirilememiş / paket yok
+        except Exception as e:  # model not downloaded / package missing
             self._model_failed = True
-            self.log.warning("transcription modeli yüklenemedi (%s): %s — transkripsiyon atlanacak", self.engine, e)
+            self.log.warning("transcription model failed to load (%s): %s — transcription skipped", self.engine, e)
             return False
 
-    # -------------------------------------------------------- ses hazırlama
+    # -------------------------------------------------------- audio preparation
     def _to_wav16k(self, src: str | Path) -> str | None:
-        """Kaydı 16 kHz mono WAV'a çevirir (whisper girişi)."""
+        """Convert the recording to 16 kHz mono WAV (whisper input)."""
         src = str(src)
         if src.lower().endswith(".wav"):
             try:
@@ -93,7 +93,7 @@ class Transcriber:
             subprocess.run(cmd, check=True, timeout=120, capture_output=True)
             return out
         except (subprocess.SubprocessError, FileNotFoundError, OSError) as e:
-            self.log.warning("ffmpeg dönüştürme hatası: %s", e)
+            self.log.warning("ffmpeg conversion error: %s", e)
             try:
                 os.unlink(out)
             except OSError:
@@ -108,20 +108,26 @@ class Transcriber:
         return None  # auto-detect
 
     def _prompt_for(self, category: str | None, override: str | None) -> str | None:
+        """Vocabulary hint for the model: config override, else built-in per category key."""
         if override:
             return override
-        if category and category in self.prompts:
+        if not category:
+            return None
+        if category in self.prompts:          # user-provided (keyed by category key or legacy name)
             return self.prompts[category]
-        return None
+        from .i18n import t
+        key = f"asr.prompt.{category}"
+        text = t(key)
+        return None if text == key else text
 
     # --------------------------------------------------------------- transcribe
     def transcribe(self, audio_path: str | Path, *, category: str | None = None,
                    language: str | None = None, prompt: str | None = None) -> TranscriptionResult:
-        """Verilen ses dosyasını yazıya döker."""
+        """Transcribe the given audio file."""
         if not self.available:
             return TranscriptionResult(status="none")
         if not Path(audio_path).exists():
-            return TranscriptionResult(status="failed", detail="dosya yok")
+            return TranscriptionResult(status="failed", detail="file missing")
         lang = self._lang_for(category, language)
         prm = self._prompt_for(category, prompt)
         try:
@@ -129,7 +135,7 @@ class Transcriber:
                 return self._transcribe_api(audio_path, lang, prm)
             wav = self._to_wav16k(audio_path)
             if not wav:
-                return TranscriptionResult(status="failed", detail="ses dönüştürülemedi")
+                return TranscriptionResult(status="failed", detail="audio conversion failed")
             try:
                 if not self._load_local():
                     return TranscriptionResult(status="none")
@@ -143,15 +149,15 @@ class Transcriber:
                     except OSError:
                         pass
         except Exception as e:
-            self.log.warning("transkripsiyon hatası: %s", e)
+            self.log.warning("transcription error: %s", e)
             return TranscriptionResult(status="failed", detail=str(e))
 
     @staticmethod
     def _wav_to_array(wav: str):
-        """16 kHz mono WAV'ı faster-whisper için float32 numpy dizisine çevirir.
+        """Convert the 16 kHz mono WAV to a float32 numpy array for faster-whisper.
 
-        faster-whisper'a dosya yolu vermek PyAV kullanır ve sürüm uyumsuzluğunda
-        (metadata_errors) patlar; diziyi doğrudan vererek bu yolu baypas ederiz."""
+        Passing a file path makes faster-whisper use PyAV, which breaks on version
+        mismatches (metadata_errors); passing the array bypasses that path."""
         import wave as _wave
         import numpy as np
         with _wave.open(wav, "rb") as w:
@@ -173,7 +179,7 @@ class Transcriber:
         try:
             audio = self._wav_to_array(wav)
         except Exception:
-            audio = wav  # son çare: dosya yolu (PyAV)
+            audio = wav  # last resort: file path (PyAV)
         segments, info = self._model.transcribe(
             audio, language=lang, beam_size=self.beam_size, vad_filter=self.vad,
             initial_prompt=prompt, condition_on_previous_text=False)
@@ -191,7 +197,7 @@ class Transcriber:
         key = self.api.get("api_key", "") or os.environ.get("OPENAI_API_KEY", "")
         model = self.api.get("model", "whisper-1")
         if not key:
-            return TranscriptionResult(status="failed", detail="API anahtarı yok")
+            return TranscriptionResult(status="failed", detail="API key missing")
         data = {"model": model}
         if lang:
             data["language"] = lang
@@ -208,12 +214,13 @@ class Transcriber:
 
 
 class TranscriptionWorker:
-    """Transkripsiyon bekleyen olayları (ses ekli) arka planda yazıya döker.
+    """Transcribes events with audio attachments in the background.
 
-    Hedefler ses olaylarını `transcript_status="pending"` ile üretir ve buraya
-    yönlendirir. İşçi dongle'ı MEŞGUL ETMEDEN (ayrı iş parçacığı) transkripsiyonu
-    yapar, olayın özet/transkript alanlarını doldurur ve Dispatcher'a iletir
-    (ses + metin aynı mesaj dizisinde gider). Motor yoksa olay doğrudan iletilir.
+    Targets produce audio events with `transcript_status="pending"` and route
+    them here. The worker transcribes WITHOUT holding the dongle (own thread),
+    fills the event's summary/transcript and hands it to the Dispatcher (audio
+    and text go out in the same message thread). Without an engine the event is
+    forwarded directly.
     """
 
     def __init__(self, transcriber: "Transcriber", dispatcher, storage, logger):
@@ -252,7 +259,7 @@ class TranscriptionWorker:
             try:
                 self._process(ev)
             except Exception as e:
-                self.log.warning("transkripsiyon işçisi hata: %s", e)
+                self.log.warning("transcription worker error: %s", e)
                 ev.transcript_status = "failed"
             finally:
                 self.dispatcher.submit(ev)
@@ -269,7 +276,7 @@ class TranscriptionWorker:
         ev.transcript_lang = res.language
         ev.transcript_status = res.status
         if res.text:
-            # özetin ilk satırını transkriptle güncelle
+            # update the summary with the first transcript line
             ev.summary = (ev.summary + " · " if ev.summary else "") + res.text.strip().splitlines()[0][:80]
             rec_id = ev.extra.get("recording_id")
             if rec_id:

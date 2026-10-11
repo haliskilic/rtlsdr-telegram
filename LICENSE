@@ -1,21 +1,114 @@
-MIT License
+rtlsdr-telegram — Source-Available License
+(Commercial License + Supporter Non-Commercial Grant)
+=======================================================
 
-Copyright (c) 2026 rtlsdr-telegram contributors
+Copyright (c) 2026 Halis KILIÇ. All rights reserved.
+Contact: haliskilic90@gmail.com
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+PLAIN-LANGUAGE SUMMARY (not a substitute for the terms below)
+  • You may read the source and evaluate the Software for 30 days.
+  • If you have made a voluntary donation to the Author (any amount), you may
+    use and modify the Software free of charge for PERSONAL, NON-COMMERCIAL
+    purposes (hobby, education, research) on your own equipment, forever.
+  • ANY commercial use (inside a business, as part of a paid product or service,
+    hosting for others, resale) requires a written commercial license purchased
+    from the Author.
+  • Third-party tools and libraries used by the Software are NOT covered by this
+    license; they keep their own licenses (see THIRD-PARTY-NOTICES.md).
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+This software, including its source code, assets and documentation
+(collectively, the "Software"), is the proprietary property of Halis KILIÇ
+(the "Author") and is protected by copyright and other intellectual property
+laws. The Software is licensed, not sold, and only under the terms below.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1. OWNERSHIP
+   The Author retains all right, title and interest in and to the Software,
+   including all intellectual property rights. No ownership is transferred by
+   this License.
+
+2. EVALUATION LICENSE
+   You may download, install and run the Software for up to thirty (30) days
+   solely to evaluate its suitability. Evaluation use confers no right to deploy
+   the Software in production or to redistribute it.
+
+3. SUPPORTER NON-COMMERCIAL LICENSE
+   A natural person who has made a voluntary donation of any amount to the
+   Author (a "Supporter") is granted a perpetual, worldwide, non-exclusive,
+   non-transferable, royalty-free license to:
+     a) install, run and use the Software on equipment they own or control,
+     b) modify the Software for their own use,
+   in each case solely for personal, non-commercial purposes such as hobby
+   radio monitoring, education and research. Supporters may share patches with
+   the Author (e.g. pull requests) but may not redistribute the Software or
+   modified versions to third parties. A donation is not a purchase and does
+   not oblige the Author to provide support, updates or warranties.
+
+4. COMMERCIAL LICENSE
+   Any use of the Software by or for a company, organisation or public body,
+   any use that generates revenue, any provision of the Software (or a service
+   based on it) to third parties, hosting as a service, bundling, resale,
+   sublicensing, renting or leasing — in whole or in part — is permitted ONLY
+   under a valid, written commercial license agreement obtained from the Author.
+   Absent such an agreement, no rights are granted for such uses.
+
+5. CONTRIBUTIONS
+   By submitting a contribution (code, documentation, translations) you grant
+   the Author a perpetual, irrevocable, worldwide, royalty-free right to use,
+   modify, sublicense and distribute the contribution as part of the Software
+   under this or any other license, and you confirm you have the right to do so.
+
+6. RESTRICTIONS
+   You may not remove or alter any copyright, trademark or proprietary notices.
+   You may not use the Author's name to endorse or promote derived products
+   without written permission. You may not circumvent the scope limits above.
+
+7. THIRD-PARTY COMPONENTS
+   The Software invokes separately installed open-source tools (e.g. readsb,
+   rtl_433, AIS-catcher, acarsdec, dumpvdl2, gr-gsm, SatDump, multimon-ng,
+   rtl-sdr) as external processes and depends on open-source Python libraries.
+   Those components are NOT part of the Software, are not bundled with it, and
+   remain governed exclusively by their own licenses (including the GPL where
+   applicable). This License covers only the Author's own original code, text
+   and assets. See THIRD-PARTY-NOTICES.md.
+
+8. LAWFUL USE
+   The Software receives radio signals. You are solely responsible for complying
+   with the radio-monitoring, privacy and telecommunications laws of your
+   jurisdiction. The Software does not transmit and must not be used to decode
+   or record communications where that is unlawful.
+
+9. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IT IS NOT A SAFETY OR
+   EMERGENCY SYSTEM; DISTRESS DETECTIONS ARE BEST-EFFORT INDICATIONS ONLY.
+
+10. LIMITATION OF LIABILITY
+   IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+   CONNECTION WITH THE SOFTWARE OR ITS USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+11. TERMINATION
+   Any breach of this License automatically terminates your rights under it;
+   you must then cease all use and destroy all copies of the Software.
+   Sections 1, 5–11 survive termination.
+
+12. GOVERNING LAW
+   This License is governed by the laws of the Republic of Türkiye. Disputes
+   are subject to the courts of Istanbul, without prejudice to mandatory
+   consumer-protection rules of your place of residence.
+
+To donate (Supporter license) or obtain a commercial license, contact:
+haliskilic90@gmail.com
+
+-------------------------------------------------------------------------------
+TÜRKÇE ÖZET (bağlayıcı metin yukarıdaki İngilizce sürümdür)
+  • Kaynağı okuyabilir, yazılımı 30 gün değerlendirebilirsiniz.
+  • Yazar'a herhangi bir miktarda gönüllü bağış yapan gerçek kişiler, yazılımı
+    KİŞİSEL ve TİCARİ OLMAYAN amaçlarla (hobi, eğitim, araştırma) kendi
+    cihazlarında süresiz ve ücretsiz kullanabilir ve değiştirebilir.
+  • Her türlü TİCARİ kullanım (şirket içi kullanım, ücretli ürün/hizmetin
+    parçası olma, başkaları için barındırma, yeniden satış) Yazar'dan alınmış
+    yazılı ticari lisans gerektirir.
+  • Yazılımın çağırdığı üçüncü taraf araç ve kütüphaneler bu lisansa dahil
+    değildir; kendi lisanslarına tabidir (THIRD-PARTY-NOTICES.md).

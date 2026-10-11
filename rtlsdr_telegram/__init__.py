@@ -1,9 +1,9 @@
-"""rtlsdr-telegram — RTL-SDR çok bantlı izleme, kayıt ve Telegram bildirim sistemi.
+"""rtlsdr-telegram — RTL-SDR multi-band monitoring, recording and Telegram notification system.
 
-Tek bir RTL2832U/R860 dongle ile 16 farklı hedefi (ADS-B, AIS, radyosonda, ISM,
-APRS, acil durum vericileri, GSM envanteri, ses bantları, Meteor-M, ISS, Inmarsat,
-spektrum anomali) sırayla izler; olayları Telegram grubunun tek bir topic'ine
-yapılandırılmış başlıklarla gönderir; ses kayıtlarını otomatik yazıya döker.
+With a single RTL2832U/R860 dongle it monitors 16 targets in turn (ADS-B, AIS,
+radiosondes, ISM sensors, APRS, distress beacons, GSM cell inventory, voice
+bands, Meteor-M, ISS, Inmarsat, spectrum anomalies), posts events to one topic
+of a Telegram group with structured headers and transcribes audio recordings.
 """
 
 __version__ = "1.0.0"

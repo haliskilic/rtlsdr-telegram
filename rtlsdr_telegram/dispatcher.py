@@ -1,13 +1,14 @@
-"""Olay dağıtıcı: öncelikli kuyruktan olayları alıp Telegram'a gönderir.
+"""Event dispatcher: takes events from the persistent priority queue and sends them to Telegram.
 
-- Tüm olaylar aynı topic'e (message_thread_id) gider; ayırt etme başlıktaki
-  yapılandırılmış alanlarla yapılır (madde 5).
-- Bir olay şu sırayla gönderilir: başlık+gövde metni → ses/görüntü ekleri
-  (ilk metne yanıt olarak, aynı dizide). Transkripsiyon metnin içindedir.
-- Acil olaylar (priority düşük) kuyrukta en öne alınır (storage ORDER BY priority).
-- Ağ kesilince gönderim başarısız olur; olay kuyrukta kalır, bağlantı gelince
-  yeniden denenir (madde 9).
-- Gönderim hızı sınırlandırılır (telegram.min_interval_s).
+- Every event goes to the same topic (message_thread_id); events are told apart
+  by the structured header fields (spec section 5).
+- An event is sent as: header+body text -> audio/image attachments (as replies
+  to the text, in the same thread). The transcript is part of the text.
+- Emergency events (lowest priority number) jump the queue (ORDER BY priority).
+- When the network is down sending fails; the event stays queued and is retried
+  when connectivity returns (spec section 9).
+- Sending is rate limited (telegram.min_interval_s). Only the configured chat
+  (or an admin's command context) is ever written to.
 """
 from __future__ import annotations
 
@@ -43,10 +44,10 @@ class Dispatcher:
         self._last_send = 0.0
         self.online = True
         self.sent_count = 0
-        self.transcriber = None  # main tarafından atanır
-        self.scheduler = None    # main tarafından atanır (susturma kontrolü için)
+        self.transcriber = None  # assigned by the application
+        self.scheduler = None    # assigned by the application (mute checks)
 
-    # ----------------------------------------------------------- yaşam döngüsü
+    # ----------------------------------------------------------- lifecycle
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, name="dispatcher", daemon=True)
         self._thread.start()
@@ -58,16 +59,16 @@ class Dispatcher:
             self._thread.join(timeout=10)
 
     def submit(self, ev: Event) -> None:
-        """Olayı kalıcı kuyruğa ekler ve göndericiyi uyandırır."""
+        """Append the event to the persistent queue and wake the sender."""
         try:
             if ev.category != Category.SISTEM:
                 self.st.insert_event(ev)
         except Exception as e:
-            self.log.warning("olay DB'ye yazılamadı: %s", e)
+            self.log.warning("event could not be stored: %s", e)
         self.st.queue_push(ev)
         self._wake.set()
 
-    # ---------------------------------------------------------------- döngü
+    # ---------------------------------------------------------------- loop
     def _loop(self) -> None:
         while not self._stop.is_set():
             item = self.st.queue_pop()
@@ -76,14 +77,14 @@ class Dispatcher:
                 self._wake.clear()
                 continue
             qid, ev, attempts = item
-            # hız sınırlama (acil olaylar hariç)
+            # rate limiting (except emergencies)
             if ev.priority > PRIO_EMERGENCY:
                 gap = self.min_interval - (time.time() - self._last_send)
                 if gap > 0:
                     self._stop.wait(gap)
             try:
                 if self._muted(ev):
-                    self.log.debug("susturulmuş kategori, atlandı: %s", ev.category.value)
+                    self.log.debug("muted category, skipped: %s", ev.category.value)
                     self.st.queue_ack(qid)
                     continue
                 self._send_event(ev, qid)
@@ -93,32 +94,32 @@ class Dispatcher:
                 self.sent_count += 1
                 if not self.online:
                     self.online = True
-                    self.log.info("telegram bağlantısı yeniden kuruldu")
+                    self.log.info("telegram connection restored")
             except TelegramError as e:
                 delay = e.retry_after or min(10 * (attempts + 1), 300)
                 if e.transient:
                     if self.online:
                         self.online = False
-                        self.log.warning("telegram çevrimdışı, kuyrukta tutuluyor: %s", e)
+                        self.log.warning("telegram offline, keeping the queue: %s", e)
                     self.st.queue_fail(qid, str(e), max(delay, 15))
                     self._stop.wait(min(delay, 30))
                 else:
-                    self.log.error("telegram kalıcı hata (olay atlanıyor): %s", e)
+                    self.log.error("telegram permanent error (event skipped): %s", e)
                     self.st.queue_fail(qid, str(e), delay)
                     if attempts >= 5:
                         self.st.queue_ack(qid)
             except Exception as e:
-                self.log.exception("gönderim beklenmeyen hata: %s", e)
+                self.log.exception("unexpected send error: %s", e)
                 self.st.queue_fail(qid, str(e), 30)
 
-    # ----------------------------------------------------------- gönderim
+    # ----------------------------------------------------------- sending
     def _silent(self, ev: Event) -> bool:
         if ev.silent is not None:
             return ev.silent
         return ev.priority >= self.quiet_priority_from
 
     def _muted(self, ev: Event) -> bool:
-        """Susturulmuş kategori: acil (öncelik 0) her zaman geçer."""
+        """Muted category check: emergencies (priority 0) always pass."""
         if ev.priority <= PRIO_EMERGENCY or ev.category == Category.SISTEM:
             return False
         sch = self.scheduler
@@ -133,8 +134,8 @@ class Dispatcher:
         thread = (ev.reply_to.get("message_thread_id") if ev.reply_to else self.thread_id)
         reply_to = ev.reply_to.get("message_id") if ev.reply_to else None
 
-        # Kısmi ilerleme: metin daha önce gönderildiyse (ek yüklemesi başarısız olup
-        # yeniden denendiğinde) metni tekrar göndermeyiz — çift mesaj önlenir.
+        # Partial progress: if the text was already sent (an attachment upload failed
+        # and we are retrying) do not send the text again — avoids duplicates.
         anchor = ev.extra.get("_anchor_msg_id") if ev.extra else None
         if not anchor:
             text = ev.to_html(self.tz, self.station_lat, self.station_lon)
@@ -152,7 +153,7 @@ class Dispatcher:
             if i in done:
                 continue
             if not att.path or not os.path.exists(att.path):
-                self.log.warning("ek dosyası bulunamadı: %s", att.path)
+                self.log.warning("attachment file not found: %s", att.path)
                 continue
             cap = att.caption
             if att.kind == "voice":
@@ -165,11 +166,11 @@ class Dispatcher:
                 except TelegramError as e:
                     if e.transient:
                         raise
-                    # fotoğraf reddedilirse (boyut/oran) belge olarak gönder
+                    # if the photo is rejected (size/ratio) send it as a document
                     self.client.send_document(chat, att.path, caption=cap, thread_id=thread, reply_to=anchor, silent=True)
             else:
                 self.client.send_document(chat, att.path, caption=cap, thread_id=thread, reply_to=anchor, silent=True)
-            # başarı: ilerlemeyi kaydet, geçici dosyayı ancak şimdi sil
+            # success: record progress, delete the temp file only now
             done.add(i)
             if qid is not None and len(ev.attachments) > 1:
                 ev.extra["_sent_atts"] = sorted(done)
@@ -183,7 +184,7 @@ class Dispatcher:
                 except OSError:
                     pass
 
-    # ---------------------------------------------------- doğrudan metin (komut yanıtı)
+    # ---------------------------------------------------- direct text (command replies)
     def send_text(self, text: str, *, chat_id=None, thread_id=None, reply_to=None, silent=True) -> None:
         try:
             self.client.send_message(chat_id or self.chat_id,
@@ -191,4 +192,4 @@ class Dispatcher:
                                      thread_id=thread_id if thread_id is not None else self.thread_id,
                                      reply_to=reply_to, silent=silent)
         except TelegramError as e:
-            self.log.warning("doğrudan metin gönderilemedi: %s", e)
+            self.log.warning("direct text send failed: %s", e)

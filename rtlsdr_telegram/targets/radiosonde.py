@@ -1,15 +1,15 @@
-"""Hedef 4 — Meteoroloji balonları (radyosonda, 400–406 MHz).
+"""Target 4 — Weather balloons (radiosondes, 400–406 MHz).
 
-İki çalışma kipi:
-  (a) Tespit (yerleşik): rtl_power ile 400–406 MHz taranır, dar-bant güçlü
-      taşıyıcılar radyosonda adayı olarak bildirilir. Dongle gerektirir.
-  (b) Telemetri (radiosonde_auto_rx entegrasyonu): auto_rx ayrı olarak kuruluysa
-      ürettiği `*_sonde.log` CSV dosyaları izlenir; kalkış (ilk kare), irtifa,
-      patlama (tepe sonrası hızlı alçalma) ve tahmini düşüş noktası bildirilir.
-      Bu kip dongle'ı auto_rx kullandığı için ayrı çalışır (fırsatçı okuma).
+Two modes:
+  (a) Detection (built in): rtl_power sweeps 400–406 MHz and strong narrow-band
+      carriers are reported as radiosonde candidates. Needs the dongle.
+  (b) Telemetry (radiosonde_auto_rx integration): when auto_rx is installed
+      separately, its `*_sonde.log` CSV files are watched; launch (first frame),
+      altitude, burst (fast descent after the peak) and an estimated landing
+      point are reported. auto_rx owns the dongle in this mode (opportunistic).
 
-Tam çözümleme radiosonde_auto_rx gerektirir (kaynaktan kurulur); yerleşik kip
-yalnızca "balon olabilir" uyarısı verir. Seçim config.auto_rx.* iledir.
+Full decoding requires radiosonde_auto_rx (built from source); the built-in
+mode only gives a "possible balloon" hint. Select with config.auto_rx.*.
 """
 from __future__ import annotations
 
@@ -22,19 +22,20 @@ import time
 from pathlib import Path
 
 from ..events import Category, PRIO_IMPORTANT
-from ..geo import haversine_km, bearing_deg, compass_tr
+from ..geo import haversine_km, bearing_deg, compass
+from ..i18n import t
 from .base import TargetBase
 
 
 class RadiosondeTarget(TargetBase):
-    NAME = "Radyosonda"
+    NAME_KEY = "sonde.name"
+    BAND_KEY = "sonde.band"
     CATEGORY = Category.METEOROLOJI
     CLASS = "waiting"
     DEFAULTS = {
         "enabled": True, "priority": 4, "dwell_s": 45, "period_s": 600,
         "scan_start_mhz": 400.0, "scan_end_mhz": 406.0, "bin_khz": 5,
         "detect_threshold_db": 12.0, "gain": "auto", "carrier_repeat_min": 180,
-        "band_label": "400–406 MHz radyosonda",
         "auto_rx": {"enabled": False, "log_dir": "", "manage": False, "descent_rate_landing": True},
     }
 
@@ -42,10 +43,10 @@ class RadiosondeTarget(TargetBase):
         if self.conf.get("auto_rx", {}).get("enabled"):
             return True, ""
         ok = self.sdr.bin_rtl_power is not None
-        return ok, ("" if ok else "rtl_power yok")
+        return ok, ("" if ok else "rtl_power not found")
 
     def needs_device(self) -> bool:
-        # auto_rx telemetri kipinde dongle'ı auto_rx tutar; biz yalnız log okuruz
+        # in auto_rx telemetry mode auto_rx owns the dongle; we only read logs
         return not self.conf.get("auto_rx", {}).get("enabled", False)
 
     def run_slot(self, stop_event: threading.Event, duration_s: float) -> None:
@@ -55,7 +56,7 @@ class RadiosondeTarget(TargetBase):
         else:
             self._detect_scan(stop_event, duration_s)
 
-    # ------------------------------------------------------- (a) tespit kipi
+    # ------------------------------------------------------- (a) detection mode
     def _detect_scan(self, stop_event, secs):
         if not self.sdr.bin_rtl_power:
             return
@@ -81,7 +82,7 @@ class RadiosondeTarget(TargetBase):
             proc = self.sdr.power_scan(start, end, binhz, integration="1", gain=self.conf.get("gain", "auto"),
                                        oneshot=True, log_path=self.cfg.log_dir / "sonde_scan.log")
         except Exception as e:
-            self.log_error(f"rtl_power kurulamadı: {e}")
+            self.log_error(f"rtl_power could not be started: {e}")
             return
         proc.on_line = on_line
         try:
@@ -107,24 +108,22 @@ class RadiosondeTarget(TargetBase):
             reported.add(bucket)
             prev = self.st.registry_get("sonde_carrier", f"{bucket:.2f}")
             is_new, _, _ = self.registry_touch("sonde_carrier", f"{bucket:.2f}", {"db": round(v - med, 1)})
-            # Aynı kalıcı taşıyıcı (pager/telemetri olabilir) her slotta tekrar bildirilmesin
+            # do not re-report the same persistent carrier (pager/telemetry) every slot
             if not is_new and prev and (time.time() - float(prev["data"].get("reported", 0))) < repeat_s:
                 continue
             d = (prev["data"] if prev else {})
             d.update({"reported": time.time(), "db": round(v - med, 1)})
             self.st.registry_set_data("sonde_carrier", f"{bucket:.2f}", d)
             ev = self.make_event(
-                "Radyosonda Taşıyıcı (aday)",
-                summary=f"{f_mhz:.3f} MHz'de güçlü taşıyıcı (+{v - med:.0f} dB) — radyosonda olabilir",
-                body=("400–406 MHz tespit taramasında güçlü dar-bant taşıyıcı bulundu. "
-                      "Tam çözümleme (seri no, konum, irtifa) için radiosonde_auto_rx'i etkinleştirin "
-                      "(config: targets.radiosonde.auto_rx.enabled)."),
-                freq_mhz=f_mhz, signal=f"+{v - med:.0f} dB taban üstü", signal_value=v,
+                t("evt.sonde_carrier"),
+                summary=t("sonde.carrier_summary", f=f"{f_mhz:.3f}", db=f"{v - med:.0f}"),
+                body=t("sonde.carrier_body"),
+                freq_mhz=f_mhz, signal=t("common.above_floor", db=f"{v - med:.0f}"), signal_value=v,
                 priority=(self.priority if not is_new else PRIO_IMPORTANT),
                 dedup_key=f"sonde-carrier-{bucket:.2f}")
             self.emit(ev)
 
-    # --------------------------------------------- (b) auto_rx telemetri kipi
+    # --------------------------------------------- (b) auto_rx telemetry mode
     def _ingest_auto_rx(self, stop_event, secs):
         log_dir = self.cfg.resolve(self.conf["auto_rx"]["log_dir"])
         deadline = time.time() + secs
@@ -152,7 +151,7 @@ class RadiosondeTarget(TargetBase):
         state = self.st.registry_get("sonde", serial)
         peak_alt = (state or {}).get("data", {}).get("peak_alt", 0) if state else 0
         peak_alt = max(peak_alt, alt if not math.isnan(alt) else 0)
-        phase = "yükseliş" if vv > 1 else ("alçalış" if vv < -2 else "sabit")
+        phase = "ascent" if vv > 1 else ("descent" if vv < -2 else "stable")
         burst = (alt < peak_alt - 500) and peak_alt > 12000
         self.registry_touch("sonde", serial, {"peak_alt": peak_alt, "last_alt": alt, "phase": phase})
 
@@ -160,33 +159,34 @@ class RadiosondeTarget(TargetBase):
         dist = haversine_km(slat, slon, lat, lon) if slat is not None else None
         loc = f"{lat:.4f}, {lon:.4f}"
         if dist is not None:
-            loc += f" ({dist:.1f} km {compass_tr(bearing_deg(slat, slon, lat, lon))})"
+            loc += f" ({dist:.1f} km {compass(bearing_deg(slat, slon, lat, lon))})"
 
-        # olay türünü faza göre belirle (her faz değişiminde bir bildirim)
+        # event type by phase (one notification per phase change)
         last_phase = (state or {}).get("data", {}).get("reported_phase") if state else None
         etype = None
         if last_phase is None:
-            etype = "Radyosonda Kalkış"
-        elif burst and last_phase != "patlama":
-            etype = "Radyosonda Patlama"
-            phase = "patlama"
-        elif phase == "alçalış" and last_phase not in ("alçalış", "patlama"):
-            etype = "Radyosonda Alçalış"
+            etype = t("evt.sonde_launch")
+        elif burst and last_phase != "burst":
+            etype = t("evt.sonde_burst")
+            phase = "burst"
+        elif phase == "descent" and last_phase not in ("descent", "burst"):
+            etype = t("evt.sonde_descent")
         if etype is None:
             return
         data = (self.st.registry_get("sonde", serial) or {}).get("data", {})
         data["reported_phase"] = phase
         self.st.registry_set_data("sonde", serial, data)
 
-        body = [f"Seri no    : {serial}", f"İrtifa     : {alt:.0f} m (tepe {peak_alt:.0f} m)",
-                f"Dikey hız  : {vv:+.1f} m/s", f"Faz        : {phase}"]
+        phase_label = t(f"sonde.phase.{phase}")
+        body = [f"{t('sonde.serial')}: {serial}", f"{t('sonde.altitude')}: {alt:.0f} m ({t('sonde.peak')} {peak_alt:.0f} m)",
+                f"{t('sonde.vspeed')}: {vv:+.1f} m/s", f"{t('sonde.phase')}: {phase_label}"]
         pred = ""
-        if burst or phase in ("alçalış", "patlama"):
+        if burst or phase in ("descent", "burst"):
             pred = self._predict_landing(lat, lon, alt, last)
             if pred:
-                body.append(f"Tahmini düşüş: {pred}")
+                body.append(f"{t('sonde.landing')}: {pred}")
         ev = self.make_event(
-            etype, summary=f"{serial} — {phase}, {alt:.0f} m" + (f", {dist:.0f} km" if dist else ""),
+            etype, summary=f"{serial} — {phase_label}, {alt:.0f} m" + (f", {dist:.0f} km" if dist else ""),
             body="\n".join(body), freq_mhz=float(last.get("freq_mhz", 0) or 0) or None,
             lat=lat, lon=lon, location_text=loc, priority=PRIO_IMPORTANT,
             dedup_key=f"sonde-{serial}-{phase}")
@@ -194,7 +194,7 @@ class RadiosondeTarget(TargetBase):
 
     @staticmethod
     def _predict_landing(lat, lon, alt, row) -> str:
-        """Basit sürüklenme tahmini: mevcut yatay hız ve alçalma hızına göre."""
+        """Simple drift estimate from current horizontal speed and descent rate."""
         try:
             vv = float(row.get("vel_v", "0") or 0)
             vh = float(row.get("vel_h", "0") or 0)
@@ -203,11 +203,11 @@ class RadiosondeTarget(TargetBase):
             return ""
         if vv >= -1 or alt <= 0:
             return ""
-        t = alt / abs(vv)  # kabaca iniş süresi (s)
-        drift = vh * t  # yatay sürüklenme (m)
-        # basit düz-dünya izdüşümü
+        secs = alt / abs(vv)  # rough time to landing (s)
+        drift = vh * secs      # horizontal drift (m)
+        # simple flat-earth projection
         d_deg = drift / 111000.0
         rad = math.radians(heading)
         nlat = lat + d_deg * math.cos(rad)
         nlon = lon + d_deg * math.sin(rad) / max(0.1, math.cos(math.radians(lat)))
-        return f"≈ {nlat:.4f}, {nlon:.4f} (~{t/60:.0f} dk sonra)"
+        return t("sonde.landing_fmt", lat=f"{nlat:.4f}", lon=f"{nlon:.4f}", min=f"{secs / 60:.0f}")

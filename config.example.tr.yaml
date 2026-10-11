@@ -1,0 +1,274 @@
+# ============================================================================
+#  rtlsdr-telegram — Örnek Yapılandırma
+#  Bu dosyayı "config.yaml" olarak kopyalayıp doldurun.
+#  Tüm ayarlar koddan ayrıdır. Eksik bırakılan her alan için güvenli bir
+#  varsayılan kullanılır (bkz. rtlsdr_telegram/config.py: DEFAULTS).
+# ============================================================================
+
+# Hedef platform: auto | linux | raspberrypi | windows
+platform: auto
+language: tr                       # Telegram mesaj dili: en | tr
+timezone: Europe/Istanbul          # yerel saat; mesajlarda UTC ile birlikte gösterilir
+
+# -------------------------------------------------- İstasyon konumu (zorunlu)
+# Uydu/ISS geçiş hesapları ve mesafe/kerteriz için kullanılır.
+station:
+  name: "RTL-SDR İstasyonu"
+  lat: 41.0082                      # enlem (derece)
+  lon: 28.9784                      # boylam (derece)
+  alt_m: 50                         # rakım (metre)
+
+# -------------------------------------------------------------- Telegram
+telegram:
+  token: "BURAYA_BOT_TOKEN"         # @BotFather'dan alınan bot token
+  chat_id: -1001234567890           # grup kimliği (süpergrup: -100... ile başlar)
+  thread_id: 0                      # topic (konu) kimliği; tüm olaylar bu tek topic'e gider
+  admins:                           # komutları yalnızca bu kullanıcı kimlikleri çalıştırabilir
+    - 123456789
+  commands_from_any_topic: true     # komutlar gruptaki herhangi bir topic'ten kabul edilsin mi
+  allow_private_admin_commands: true# yöneticiler bota özelden de komut verebilsin mi
+  min_interval_s: 2.0               # mesajlar arası asgari süre (flood koruması)
+  quiet_priority_from: 4            # bu öncelik ve üstü (sayıca) sessiz bildirim (acil her zaman sesli)
+  startup_message: true             # açılışta/kapanışta durum mesajı gönder
+  heartbeat_hours: 0                # >0 ise bu kadar saatte bir kısa "yaşıyorum" mesajı
+  proxy: ""                         # örn. "socks5://127.0.0.1:9050" (boş = doğrudan)
+
+# ------------------------------------------------------------------ SDR
+sdr:
+  device_index: 0
+  serial: ""                        # birden fazla dongle varsa seri no ile seçim
+  sample_rate: 2400000
+  gain: 40                          # dB; "auto" = AGC
+  ppm: 0                            # frekans düzeltmesi (rtl_test -p ile ölçülür)
+  bias_tee: false                   # anten besleme (yalnız destekleyen dongle)
+
+# ------------------------------------------------------ Zamanlayıcı (tek dongle)
+scheduler:
+  min_slot_s: 10
+  pass_lead_s: 30                   # uydu geçişinden kaç sn önce önceliğe alınsın
+  boost_minutes: 30                 # /oncelik komutunun etki süresi
+  no_device_retry_s: 60             # dongle yoksa yeniden deneme aralığı
+  adhoc_default_s: 120              # /tara varsayılan dinleme süresi
+
+# --------------------------------------------------- Kara liste (FM/TV dahil)
+# Bu aralıklar asla taranmaz. İstediğiniz aralığı ekleyebilirsiniz.
+blacklist:
+  - {name: "FM Radyo", start_mhz: 87.5, end_mhz: 108.0}
+  - {name: "VHF Band III TV/DAB", start_mhz: 174.0, end_mhz: 240.0}
+  - {name: "UHF TV (DVB-T2)", start_mhz: 470.0, end_mhz: 694.0}
+
+# ------------------------------------------------------- Transkripsiyon (Özellik A)
+transcription:
+  engine: faster_whisper            # faster_whisper | whisper | api | none
+  model: base                       # tiny | base | small | medium (büyüdükçe doğru ama yavaş)
+  device: cpu                       # cpu | cuda
+  compute_type: int8                # int8 (CPU önerilir) | float16 (GPU)
+  language: auto                    # auto | tr | en  (otomatik algılama varsayılan)
+  vad: true                         # sessizlik filtresi
+  beam_size: 1
+  api:                              # engine=api için (OpenAI uyumlu)
+    base_url: "https://api.openai.com/v1"
+    api_key: ""
+    model: "whisper-1"
+
+# ---------------------------------------------------------------- Ses kaydı
+audio:
+  format: ogg                       # ogg (opus, önerilir) | mp3 | wav
+  opus_bitrate: "24k"
+  keep_wav: false                   # ham WAV'ı da sakla
+
+# ------------------------------------------------------- Günlük özet (Özellik B)
+summary:
+  enabled: true
+  time: "09:00"                     # yerel saat
+  attach_csv: true                  # olay dökümünü CSV olarak ekle
+  top_n: 5
+
+# ------------------------------------------------------------------ Yollar
+paths:
+  data_dir: "./data"
+  recordings_dir: "./data/recordings"
+  log_dir: "./logs"
+  retention_days: 30                # bu günden eski kayıtlar silinir
+  retention_months: 0               # >0 ise gün yerine ay (döngüsel saklama)
+  retention_years: 0                # >0 ise yıl
+  min_free_disk_pct: 10             # boş disk bu yüzdenin altına inince en eski kayıtlar silinir
+  tool_log_max_mb: 5                # araç logları (adsb.log ...) bu boyutta döndürülür
+  log_level: INFO                   # DEBUG | INFO | WARNING
+
+# -------------------------------------------------------------- Uydu / TLE
+satellites:
+  # Sırayla denenecek TLE kaynakları ({norad} yer tutucusu). İlk çalışan kullanılır.
+  tle_urls:
+    - "https://tle.ivanstanojevic.me/api/tle/{norad}"
+    - "https://celestrak.org/NORAD/elements/gp.php?CATNR={norad}&FORMAT=tle"
+  tle_max_age_h: 24                 # TLE'yi bu kadar saatte bir tazele
+  tle_retry_min: 30                 # tüm kaynaklar başarısızsa bu kadar dk sonra tekrar dene
+  refresh_min: 60
+
+# ============================================================================
+#  HEDEFLER
+#  Her hedef için ortak alanlar: enabled, priority (0=en yüksek), dwell_s
+#  (dinleme süresi), period_s (ne sıklıkla). Hedefe özel alanlar aşağıda.
+#  Aşağıda yalnızca sık değiştirilenler gösterildi; tüm alanların varsayılanı
+#  DEFAULTS içindedir ve burada yazmasanız da geçerlidir.
+# ============================================================================
+targets:
+
+  # 1) Uçak takibi (ADS-B 1090 MHz) — readsb
+  adsb:
+    enabled: true
+    priority: 3
+    dwell_s: 90
+    period_s: 300
+    gain: auto
+    low_alt_ft: 3000                # bu irtifanın altı "alçak uçuş" işaretlenir
+    report_mode: summary            # summary: slot sonunda tek özet (yoğun bölge için) | each: her yeni uçak ayrı
+    report_nearby_km: 8             # bu mesafedeki yeni/alçak uçaklar her kipte ayrı mesaj alır
+
+  # 2) ACARS/VDL2 (uçak veri mesajları) — acarsdec + dumpvdl2
+  acars:
+    enabled: true
+    dwell_s: 60
+    period_s: 600
+    acars: {enabled: true, freqs_mhz: [131.525, 131.725, 131.825]}
+    vdl2:  {enabled: true, freqs_mhz: [136.725, 136.775, 136.875, 136.975]}
+
+  # 3) Gemi takibi (AIS) — AIS-catcher
+  ais:
+    enabled: true
+    dwell_s: 90
+    period_s: 300
+    report_mode: summary            # summary | each (Marmara gibi yoğun sularda summary önerilir)
+    report_nearby_km: 5             # yeni ve bu kadar yakın gemiler ayrı mesaj alır
+    # AIS-SART / MOB / EPIRB-AIS (MMSI 970/972/974) otomatik ACİL alarm üretir
+
+  # 4) Radyosonda (400–406 MHz) — tespit + radiosonde_auto_rx telemetri
+  radiosonde:
+    enabled: true
+    dwell_s: 45
+    period_s: 600
+    auto_rx:
+      enabled: false                # true: auto_rx telemetri loglarını oku (tam çözüm)
+      log_dir: "/opt/radiosonde_auto_rx/auto_rx/log"
+
+  # 5) ISM sensörler (433.92 / 868 MHz) — rtl_433
+  ism:
+    enabled: true
+    dwell_s: 60
+    period_s: 300
+    freqs_mhz: [433.92, 868.0]
+    report_readings: false          # true: her okumayı da bildir (çok mesaj üretir)
+    individual_max: 2               # slotta bu kadar yeni cihaza kadar ayrı mesaj; fazlası tek özet
+
+  # 6) APRS (144.800 MHz) — multimon-ng
+  aprs:
+    enabled: true
+    dwell_s: 45
+    period_s: 300
+
+  # 7) Acil durum vericileri (406 / 121.5 MHz) — EN YÜKSEK ÖNCELİK
+  emergency:
+    enabled: true
+    priority: 0
+    period_s: 240
+    dwell_406_s: 25                 # 406 MHz sürekli tarama süresi (vericiler ~50 sn'de bir yayın yapar)
+    dwell_121_s: 10
+    watch_406: true
+    watch_121_5: true
+    record_121_5: true
+
+  # 8) GSM hücre envanteri — gr-gsm (YALNIZ kimlik, içerik yok)
+  gsm:
+    enabled: true
+    priority: 6
+    dwell_s: 180                    # tarama dwell içinde bitmeli (sonuçlar tarama sonunda yazılır)
+    period_s: 3600
+    bands: [GSM900]                 # DCS1800 eklerseniz dwell_s: 420 veya üstü verin
+    speed: 27                       # grgsm_scanner --speed (0–29, yüksek = hızlı)
+
+  # 9) Amatör telsiz ses (144–146 / 430–440 MHz) — FM squelch
+  amateur_voice:
+    enabled: true
+    dwell_s: 90
+    period_s: 300
+    threshold_dbfs: -42             # VOX eşiği (dBFS); bu seviyeyi aşınca kayıt başlar
+    # Aşağıdakiler tüm ses hedefleri için geçerli (amateur_voice/airband/marine_voice/cb_pmr):
+    # scan_ranges: [{start_mhz: 144.0, end_mhz: 146.0, step_khz: 12.5}]  # bant taraması; aktif kanallar öne alınır
+    # scan_threshold_db: 10         # taban gürültüsünün bu kadar üstü "aktif kanal"
+    # scan_max_channels: 3          # taramadan en fazla kaç kanal dinlensin
+    # require_dynamics: true        # düz seviyeli (statik/taşıyıcı) segmentleri reddet
+    # min_dynamics_db: 2.5          # konuşma dinamiği eşiği; artırmak statik gürültüyü daha çok eler
+    # squelch: 0                    # rtl_fm donanım squelch (0=kapalı); antenle kalibre edilir
+    transcribe_language: tr
+    channels:
+      - {freq_mhz: 145.500, name: "2m çağrı simpleks"}
+      - {freq_mhz: 145.675, name: "Röle çıkışı"}
+      - {freq_mhz: 433.500, name: "70cm çağrı simpleks"}
+
+  # 10) Hava bandı (118–137 MHz) — AM
+  airband:
+    enabled: true
+    dwell_s: 90
+    period_s: 300
+    threshold_dbfs: -38
+    transcribe_language: en         # havacılık İngilizcesi
+    channels:
+      - {freq_mhz: 118.100, name: "Kule (örnek — kendi havalimanınıza göre değiştirin)"}
+      - {freq_mhz: 121.500, name: "Acil (Guard)"}
+
+  # 11) Deniz VHF (156–162 MHz) — FM, Kanal 16 öncelikli
+  marine_voice:
+    enabled: true
+    dwell_s: 90
+    period_s: 300
+    threshold_dbfs: -40
+    transcribe_language: tr
+    channels:
+      - {freq_mhz: 156.800, name: "Kanal 16 (Acil/Çağrı)"}
+      - {freq_mhz: 156.650, name: "Kanal 13 (Köprü-köprü)"}
+
+  # 12) CB / PMR446 (26–28 / 446 MHz) — FM
+  cb_pmr:
+    enabled: true
+    dwell_s: 60
+    period_s: 360
+
+  # 13) Meteor-M uydusu (LRPT 137 MHz) — SatDump (geçişte görüntü)
+  meteor:
+    enabled: true
+    priority: 2
+    min_elevation: 20
+    gain: 42
+    satellites:
+      - {name: "METEOR-M2 3", norad: 57166, freq_mhz: 137.9, pipeline: "meteor_m2-x_lrpt"}
+      - {name: "METEOR-M2 4", norad: 59051, freq_mhz: 137.1, pipeline: "meteor_m2-x_lrpt_80k"}
+
+  # 14) ISS (145.800/145.825 MHz) — geçişte ses/SSTV/paket
+  iss:
+    enabled: true
+    priority: 2
+    min_elevation: 15
+    mode: voice                     # voice | sstv | aprs
+    transcribe_language: en
+    sstv_decoder_cmd: ""            # örn. "sstv -d {wav} -o {outdir}/img.png"  (kuruluysa)
+
+  # 15) Inmarsat STD-C/AERO (~1.5 GHz) — EK DONANIM (L-bant anten+LNA)
+  inmarsat:
+    enabled: false                  # donanım yoksa kapalı bırakın
+    active: false                   # true: donanım var, dinlemeyi dene
+    freq_mhz: 1541.45
+    gain: 49
+    decoder_cmd: ""                 # örn. SatDump: "satdump live inmarsat_std_c /tmp/stdc --source rtlsdr --samplerate 1e6 --frequency {freq_hz} --gain {gain} --bias --timeout 600"
+
+  # 16) Spektrum tarama ve anomali tespiti (24–1766 MHz, FM/TV hariç)
+  spectrum:
+    enabled: true
+    dwell_s: 120
+    period_s: 600
+    bin_khz: 25
+    threshold_db: 10                # taban gürültüsünün bu kadar dB üstü = anomali
+    learn_scans: 3                  # ilk N tarama "öğrenme" (alarm yok)
+    waterfall: true                 # anomali için odaklı şelale görüntüsü üret
+    repeat_min: 60                  # aynı anomali en erken bu kadar dk sonra tekrar bildirilir
+    # Her slotta tek alt aralık (≈200 MHz) taranır; ~7 slotta tüm spektrum döner.
