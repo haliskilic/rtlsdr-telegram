@@ -1,0 +1,25 @@
+# systemd servis birimi (Linux / LXC / Raspberry Pi).
+# Kurulum:  sudo cp rtlsdr-telegram.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now rtlsdr-telegram
+[Unit]
+Description=RTL-SDR Çok Bantlı İzleme ve Telegram Bildirim Sistemi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Kurulum dizininize göre düzenleyin:
+WorkingDirectory=/opt/rtlsdr-telegram
+# /usr/local/bin kaynaktan derlenen araçlar (acarsdec, dumpvdl2, AIS-catcher) için ŞART:
+Environment=PATH=/opt/rtlsdr-telegram/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/rtlsdr-telegram/venv/bin/python /opt/rtlsdr-telegram/run.py -c /opt/rtlsdr-telegram/config.yaml
+Restart=always
+RestartSec=10
+# Kaynak sınırları (Pi'de düşürülebilir)
+Nice=5
+# Günlükler journald + dosya (logs/)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

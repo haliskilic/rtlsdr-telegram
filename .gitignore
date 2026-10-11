@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Yapılandırma (gizli bilgi içerir) — asla commit etme
+config.yaml
+
+# Çalışma zamanı verileri
+data/
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.wav
+*.ogg
+*.mp3
+*.png
+tle/
+
+# İşletim sistemi
+.DS_Store
+Thumbs.db

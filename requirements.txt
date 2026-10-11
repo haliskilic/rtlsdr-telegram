@@ -1,0 +1,22 @@
+# --- Çekirdek (zorunlu) ---
+PyYAML>=6.0
+httpx>=0.24           # Telegram Bot API ve TLE indirme (ek bağımlılık gerektirmez)
+
+# --- Sinyal işleme / görselleştirme ---
+numpy>=1.22           # DSP, spektrum analizi
+scipy>=1.8            # (opsiyonel filtreler; yoksa temel işlevler çalışır)
+matplotlib>=3.5       # spektrum şelale (waterfall) görüntüleri
+
+# --- Uydu geçiş hesabı ---
+skyfield>=1.45        # TLE tabanlı Meteor-M / ISS geçiş tahmini
+
+# --- Çözümleme yardımcıları ---
+aprslib>=0.7          # APRS çerçeve ayrıştırma
+psutil>=5.9           # /durum için CPU/RAM/sıcaklık
+
+# --- Transkripsiyon (opsiyonel; engine=none ise gerekmez) ---
+faster-whisper>=0.10  # yerel Whisper (CTranslate2). Alternatif: openai-whisper
+# openai-whisper      # engine=whisper için (daha ağır)
+
+# Pillow genelde matplotlib ile gelir; görüntü işleme için:
+Pillow>=9.0

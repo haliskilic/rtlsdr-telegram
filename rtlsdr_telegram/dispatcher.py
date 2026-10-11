@@ -1,0 +1,160 @@
+"""Olay dağıtıcı: öncelikli kuyruktan olayları alıp Telegram'a gönderir.
+
+- Tüm olaylar aynı topic'e (message_thread_id) gider; ayırt etme başlıktaki
+  yapılandırılmış alanlarla yapılır (madde 5).
+- Bir olay şu sırayla gönderilir: başlık+gövde metni → ses/görüntü ekleri
+  (ilk metne yanıt olarak, aynı dizide). Transkripsiyon metnin içindedir.
+- Acil olaylar (priority düşük) kuyrukta en öne alınır (storage ORDER BY priority).
+- Ağ kesilince gönderim başarısız olur; olay kuyrukta kalır, bağlantı gelince
+  yeniden denenir (madde 9).
+- Gönderim hızı sınırlandırılır (telegram.min_interval_s).
+"""
+from __future__ import annotations
+
+import os
+import threading
+import time
+from zoneinfo import ZoneInfo
+
+from .events import Event, Category, PRIO_EMERGENCY
+from .telegram import TelegramClient, TelegramError
+
+
+class Dispatcher:
+    def __init__(self, cfg, storage, client: TelegramClient, logger):
+        self.cfg = cfg
+        self.st = storage
+        self.client = client
+        self.log = logger
+        tg = cfg.section("telegram")
+        self.chat_id = tg.get("chat_id")
+        self.thread_id = tg.get("thread_id") or None
+        self.min_interval = float(tg.get("min_interval_s", 2.0))
+        self.quiet_priority_from = int(tg.get("quiet_priority_from", 4))
+        try:
+            self.tz = ZoneInfo(cfg.get("timezone", "Europe/Istanbul"))
+        except Exception:
+            self.tz = ZoneInfo("UTC")
+        self.station_lat = cfg.get("station.lat")
+        self.station_lon = cfg.get("station.lon")
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_send = 0.0
+        self.online = True
+        self.sent_count = 0
+        self.transcriber = None  # main tarafından atanır
+
+    # ----------------------------------------------------------- yaşam döngüsü
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="dispatcher", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread:
+            self._thread.join(timeout=10)
+
+    def submit(self, ev: Event) -> None:
+        """Olayı kalıcı kuyruğa ekler ve göndericiyi uyandırır."""
+        try:
+            if ev.category != Category.SISTEM:
+                self.st.insert_event(ev)
+        except Exception as e:
+            self.log.warning("olay DB'ye yazılamadı: %s", e)
+        self.st.queue_push(ev)
+        self._wake.set()
+
+    # ---------------------------------------------------------------- döngü
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            item = self.st.queue_pop()
+            if item is None:
+                self._wake.wait(timeout=5)
+                self._wake.clear()
+                continue
+            qid, ev, attempts = item
+            # hız sınırlama (acil olaylar hariç)
+            if ev.priority > PRIO_EMERGENCY:
+                gap = self.min_interval - (time.time() - self._last_send)
+                if gap > 0:
+                    self._stop.wait(gap)
+            try:
+                self._send_event(ev)
+                self.st.queue_ack(qid)
+                self.st.mark_sent(ev.db_id)
+                self._last_send = time.time()
+                self.sent_count += 1
+                if not self.online:
+                    self.online = True
+                    self.log.info("telegram bağlantısı yeniden kuruldu")
+            except TelegramError as e:
+                delay = e.retry_after or min(10 * (attempts + 1), 300)
+                if e.transient:
+                    if self.online:
+                        self.online = False
+                        self.log.warning("telegram çevrimdışı, kuyrukta tutuluyor: %s", e)
+                    self.st.queue_fail(qid, str(e), max(delay, 15))
+                    self._stop.wait(min(delay, 30))
+                else:
+                    self.log.error("telegram kalıcı hata (olay atlanıyor): %s", e)
+                    self.st.queue_fail(qid, str(e), delay)
+                    if attempts >= 5:
+                        self.st.queue_ack(qid)
+            except Exception as e:
+                self.log.exception("gönderim beklenmeyen hata: %s", e)
+                self.st.queue_fail(qid, str(e), 30)
+
+    # ----------------------------------------------------------- gönderim
+    def _silent(self, ev: Event) -> bool:
+        if ev.silent is not None:
+            return ev.silent
+        return ev.priority >= self.quiet_priority_from
+
+    def _send_event(self, ev: Event) -> None:
+        silent = self._silent(ev)
+        chat = ev.reply_to["chat_id"] if ev.reply_to else self.chat_id
+        thread = (ev.reply_to.get("message_thread_id") if ev.reply_to else self.thread_id)
+        reply_to = ev.reply_to.get("message_id") if ev.reply_to else None
+
+        text = ev.to_html(self.tz, self.station_lat, self.station_lon)
+        msg_ids = self.client.send_message(chat, text, thread_id=thread, reply_to=reply_to, silent=silent)
+        anchor = msg_ids[0] if msg_ids else None
+
+        for att in ev.attachments:
+            if not att.path or not os.path.exists(att.path):
+                self.log.warning("ek dosyası bulunamadı: %s", att.path)
+                continue
+            cap = att.caption
+            try:
+                if att.kind == "voice":
+                    self.client.send_voice(chat, att.path, caption=cap, thread_id=thread,
+                                           reply_to=anchor, silent=True)
+                elif att.kind == "audio":
+                    self.client.send_audio(chat, att.path, caption=cap, thread_id=thread,
+                                           reply_to=anchor, silent=True)
+                elif att.kind == "photo":
+                    self.client.send_photo(chat, att.path, caption=cap, thread_id=thread,
+                                           reply_to=anchor, silent=True)
+                else:
+                    self.client.send_document(chat, att.path, caption=cap, thread_id=thread,
+                                              reply_to=anchor, silent=True)
+            except TelegramError:
+                raise
+            finally:
+                if att.delete_after:
+                    try:
+                        os.unlink(att.path)
+                    except OSError:
+                        pass
+
+    # ---------------------------------------------------- doğrudan metin (komut yanıtı)
+    def send_text(self, text: str, *, chat_id=None, thread_id=None, reply_to=None, silent=True) -> None:
+        try:
+            self.client.send_message(chat_id or self.chat_id,
+                                     text,
+                                     thread_id=thread_id if thread_id is not None else self.thread_id,
+                                     reply_to=reply_to, silent=silent)
+        except TelegramError as e:
+            self.log.warning("doğrudan metin gönderilemedi: %s", e)
