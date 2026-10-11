@@ -47,6 +47,8 @@ class SpectrumTarget(TargetBase):
         "max_anomalies_per_slot": 4, "min_bandwidth_khz": 25,
         "waterfall": True, "band_label": "24–1766 MHz spektrum (FM/TV hariç)",
         "sub_range_max_mhz": 200,
+        "repeat_min": 60,              # aynı anomali en erken bu kadar dk sonra tekrar bildirilir
+        "focus_capture_s": 12,         # anomali için odaklı şelale yakalama süresi
     }
 
     def tools_available(self):
@@ -79,17 +81,22 @@ class SpectrumTarget(TargetBase):
         return out
 
     def run_slot(self, stop_event: threading.Event, duration_s: float) -> None:
+        """Her slotta TEK alt aralık, tam dwell süresiyle taranır (rotasyon).
+
+        Önceki yaklaşım (tüm alt aralıklar her slotta) rtl_power'a aralık başına
+        ~17 sn bırakıyor, 200 MHz'lik aralığın ancak %15'i süpürülüyor ve taban
+        profili dengesiz öğreniliyordu. Rotasyonla ~7 slotta tüm spektrum kapsanır."""
         if not self.check_tools():
             return
         subs = self._subranges()
         if not subs:
             return
-        per = duration_s / len(subs)
-        anomalies_left = int(self.conf.get("max_anomalies_per_slot", 4))
-        for (a, b) in subs:
-            if stop_event.is_set() or anomalies_left <= 0:
-                break
-            anomalies_left -= self._scan_subrange(a, b, min(per, 60), stop_event, anomalies_left)
+        idx = int(self.st.kv_get("spectrum_rotation_idx", 0) or 0) % len(subs)
+        a, b = subs[idx]
+        self.st.kv_set("spectrum_rotation_idx", (idx + 1) % len(subs))
+        self.log.info("spektrum: %.0f–%.0f MHz taranıyor (%d/%d)", a, b, idx + 1, len(subs))
+        budget = int(self.conf.get("max_anomalies_per_slot", 4))
+        self._scan_subrange(a, b, duration_s, stop_event, budget)
 
     def _scan_subrange(self, start_mhz, end_mhz, secs, stop_event, budget) -> int:
         binhz = int(self.conf.get("bin_khz", 25) * 1000)
@@ -123,8 +130,13 @@ class SpectrumTarget(TargetBase):
                 stop_event.wait(0.5)
         finally:
             proc.stop()
+            try:
+                self.sdr.mark_released()
+            except Exception:
+                pass
         if not series:
             return 0
+        self._stop_event = stop_event
         return self._analyze(start_mhz, end_mhz, series, budget)
 
     def _analyze(self, start_mhz, end_mhz, series, budget) -> int:
@@ -139,11 +151,9 @@ class SpectrumTarget(TargetBase):
         freqs = sorted(buckets)
         profile = {f: (sum(v) / len(v)) for f, v in buckets.items()}
 
-        # taban profili yükle
+        # taban profili yükle (npz: kv JSON'a göre ~10x küçük ve hızlı)
         bl_key = f"spectrum_baseline_{start_mhz:.0f}_{end_mhz:.0f}"
-        state = self.st.kv_get(bl_key, {}) or {}
-        baseline = state.get("baseline", {})
-        scans = int(state.get("scans", 0))
+        baseline, scans = self._load_baseline(bl_key)
         alpha = float(self.conf.get("ema_alpha", 0.2))
         thr = float(self.conf.get("threshold_db", 10.0))
         floor_db = float(self.conf.get("min_abs_floor_db", 6.0))
@@ -172,8 +182,7 @@ class SpectrumTarget(TargetBase):
             old = baseline.get(key)
             a = alpha * 0.2 if f in anomaly_set else alpha
             new_base[key] = cur if old is None else (a * cur + (1 - a) * old)
-        self.st.kv_set(bl_key, {"baseline": new_base, "scans": scans + 1,
-                                "updated": time.time(), "noise_floor": noise_floor})
+        self._save_baseline(bl_key, new_base, scans + 1, noise_floor)
 
         if learning:
             self.log.info("spektrum öğrenme %d/%s (%.0f–%.0f MHz)", scans + 1,
@@ -192,6 +201,81 @@ class SpectrumTarget(TargetBase):
                 pass  # tek kutu da olsa güçlüyse bildir
             emitted += self._emit_anomaly(g, series, start_mhz, end_mhz, noise_floor)
         return emitted
+
+    # ------------------------------------------------------- taban dosyası
+    def _baseline_path(self, key: str):
+        d = self.cfg.data_dir / "spectrum"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{key}.npz"
+
+    def _load_baseline(self, key: str) -> tuple[dict, int]:
+        if not HAVE_NUMPY:
+            st = self.st.kv_get(key, {}) or {}
+            return st.get("baseline", {}), int(st.get("scans", 0))
+        path = self._baseline_path(key)
+        if not path.exists():
+            return {}, 0
+        try:
+            z = np.load(path)
+            freqs = z["freqs"]; vals = z["vals"]; scans = int(z["scans"])
+            return {float(f): float(v) for f, v in zip(freqs, vals)}, scans
+        except Exception as e:
+            self.log.warning("taban yüklenemedi (%s): %s", key, e)
+            return {}, 0
+
+    def _save_baseline(self, key: str, base: dict, scans: int, noise_floor: float) -> None:
+        if not HAVE_NUMPY:
+            self.st.kv_set(key, {"baseline": base, "scans": scans, "noise_floor": noise_floor})
+            return
+        try:
+            items = sorted((float(k), float(v)) for k, v in base.items())
+            np.savez(self._baseline_path(key), freqs=np.array([f for f, _ in items], dtype=np.float64),
+                     vals=np.array([v for _, v in items], dtype=np.float32), scans=scans,
+                     noise_floor=noise_floor, updated=time.time())
+        except Exception as e:
+            self.log.warning("taban kaydedilemedi (%s): %s", key, e)
+
+    def _focused_waterfall(self, peak_f: float, f_lo: float, f_hi: float) -> str | None:
+        """Anomali etrafında dar bantta kısa süreli rtl_power → gerçek zaman ekseni."""
+        if not self.sdr.bin_rtl_power:
+            return None
+        stop_event = getattr(self, "_stop_event", None)
+        secs = float(self.conf.get("focus_capture_s", 12))
+        span = max(0.4, (f_hi - f_lo) * 3)
+        lo, hi = max(24.0, peak_f - span / 2), min(1766.0, peak_f + span / 2)
+        series: list[tuple[float, float, list[float]]] = []
+
+        def on_line(line):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 7:
+                return
+            try:
+                f_low = float(parts[2]); step = float(parts[4])
+                vals = [float(x) for x in parts[6:] if x not in ("", "-inf", "nan")]
+            except ValueError:
+                return
+            series.append((f_low, step, vals))
+        try:
+            proc = self.sdr.power_scan(int(lo * 1e6), int(hi * 1e6), 5000, integration="1",
+                                       gain=self.conf.get("gain", "auto"), oneshot=False,
+                                       log_path=self.cfg.log_dir / "spectrum_focus.log")
+        except Exception:
+            return None
+        proc.on_line = on_line
+        try:
+            proc.start()
+            t0 = time.time()
+            while time.time() - t0 < secs and proc.running and not (stop_event and stop_event.is_set()):
+                time.sleep(0.3)
+        finally:
+            proc.stop()
+            try:
+                self.sdr.mark_released()
+            except Exception:
+                pass
+        if len(series) < 3:
+            return None
+        return self._waterfall(series, peak_f, f_lo, f_hi)
 
     @staticmethod
     def _group(bins):
@@ -217,13 +301,25 @@ class SpectrumTarget(TargetBase):
         peak_f = g["peak_f"]
         bw_khz = (g["f_hi"] - g["f_lo"]) * 1000 + float(self.conf.get("bin_khz", 25))
         key = f"{peak_f:.2f}"
+        prev = self.st.registry_get("spectrum_anom", key)
         is_new, first_seen, count = self.registry_touch(
             "spectrum_anom", key, {"peak_db": round(g["peak_p"], 1), "bw_khz": round(bw_khz, 1)})
         duration = time.time() - first_seen if not is_new else 0
+        # Süregelen aynı sinyal her slotta tekrar bildirilmesin (repeat_min)
+        repeat_s = float(self.conf.get("repeat_min", 60)) * 60
+        if not is_new and prev:
+            last_rep = float(prev["data"].get("reported", 0) or 0)
+            if time.time() - last_rep < repeat_s:
+                return 0
+        data = (prev["data"] if prev else {})
+        data.update({"reported": time.time(), "peak_db": round(g["peak_p"], 1)})
+        self.st.registry_set_data("spectrum_anom", key, data)
 
         atts = []
         if self.conf.get("waterfall", True) and HAVE_NUMPY:
-            img = self._waterfall(series, peak_f, g["f_lo"], g["f_hi"])
+            # Odaklı şelale: anomali etrafında dar bant, kısa süreli zaman serisi
+            img = self._focused_waterfall(peak_f, g["f_lo"], g["f_hi"]) or \
+                self._waterfall(series, peak_f, g["f_lo"], g["f_hi"])
             if img:
                 atts.append(Attachment("photo", img, caption=f"Şelale: {peak_f:.3f} MHz", delete_after=False))
 

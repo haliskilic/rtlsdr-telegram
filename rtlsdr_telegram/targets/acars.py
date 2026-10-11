@@ -25,6 +25,9 @@ class ACARSTarget(TargetBase):
         "vdl2": {"enabled": True, "freqs_mhz": [136.725, 136.775, 136.875, 136.975], "gain": "auto"},
         "band_label": "131 MHz ACARS / 136.7–137 MHz VDL2",
         "report_all": True,
+        "include_uplinks": True,     # False: yalnız uçaktan gelen (downlink) mesajlar (-A)
+        "station_id": "RTLTG",
+        "max_events_per_slot": 15,  # fazlası tek özet mesajında toplanır
     }
 
     def tools_available(self):
@@ -56,11 +59,21 @@ class ACARSTarget(TargetBase):
         conf = self.conf.get("acars", {})
         freqs = [f"{f:.3f}" for f in conf.get("freqs_mhz", [131.725])]
         gain = conf.get("gain", "auto")
-        cmd = [binary, "-o", "4", "-r", str(self.sdr.device_index)]
-        if gain not in ("auto", "agc", None, -1):
-            cmd = [binary, "-o", "4", "-g", str(gain), "-r", str(self.sdr.device_index)]
-        cmd += freqs
+        cmd = [binary, "-o", "4", "-e"]
+        if not self.conf.get("include_uplinks", True):
+            cmd.append("-A")
+        sid = self.conf.get("station_id")
+        if sid:
+            cmd += ["-i", str(sid)]
+        if not self.sdr.is_auto_gain(gain):
+            cmd += ["-g", str(gain)]
+        if self.sdr.ppm:
+            cmd += ["-p", str(self.sdr.ppm)]
+        cmd += ["-r", str(self.sdr.device_index)] + freqs
+        self._slot_count = 0
+        self._overflow = []
         self.run_tool_lines(cmd, stop_event, secs, self._on_acars_line, name="acarsdec", log_name="acarsdec")
+        self._flush_overflow("ACARS")
 
     def _on_acars_line(self, line: str):
         line = line.strip()
@@ -93,7 +106,7 @@ class ACARSTarget(TargetBase):
             freq_mhz=float(freq) if freq else None, band="131 MHz ACARS",
             signal=(f"{level} dBFS" if level is not None else None), signal_value=level,
             dedup_key=f"acars-{key}")
-        self.emit(ev)
+        self._emit_capped(ev, summary)
 
     # ------------------------------------------------------------------ VDL2
     def _run_vdl2(self, stop_event, secs):
@@ -102,12 +115,15 @@ class ACARSTarget(TargetBase):
         freqs = [str(int(round(f * 1e6))) for f in conf.get("freqs_mhz", [136.975])]
         gain = conf.get("gain", "auto")
         cmd = [binary, "--rtlsdr", str(self.sdr.device_index), "--output", "decoded:json:file:path=-"]
-        if gain not in ("auto", "agc", None, -1):
+        if not self.sdr.is_auto_gain(gain):
             cmd += ["--gain", str(gain)]
         if self.sdr.ppm:
             cmd += ["--correction", str(self.sdr.ppm)]
         cmd += freqs
+        self._slot_count = 0
+        self._overflow = []
         self.run_tool_lines(cmd, stop_event, secs, self._on_vdl2_line, name="dumpvdl2", log_name="dumpvdl2")
+        self._flush_overflow("VDL2")
 
     def _on_vdl2_line(self, line: str):
         line = line.strip()
@@ -141,7 +157,31 @@ class ACARSTarget(TargetBase):
             signal=(f"{sig:.1f} dBFS" if isinstance(sig, (int, float)) else None),
             signal_value=sig if isinstance(sig, (int, float)) else None,
             dedup_key=f"vdl2-{key}")
+        self._emit_capped(ev, summary)
+
+    # ---------------------------------------------------- slot başına üst sınır
+    _slot_count = 0
+    _overflow: list = []
+
+    def _emit_capped(self, ev, line: str):
+        cap = int(self.conf.get("max_events_per_slot", 15))
+        if self._slot_count < cap:
+            self._slot_count += 1
+            self.emit(ev)
+        else:
+            self._overflow.append(line)
+
+    def _flush_overflow(self, label: str):
+        if not self._overflow:
+            return
+        n = len(self._overflow)
+        body = "\n".join(f"• {l}" for l in self._overflow[:30])
+        if n > 30:
+            body += f"\n… ve {n - 30} mesaj daha"
+        ev = self.make_event(f"{label} Özet", summary=f"Slot sınırı aşıldı: {n} ek {label} mesajı",
+                             body=body, priority=self.priority + 1)
         self.emit(ev)
+        self._overflow = []
 
     @staticmethod
     def _trim(text: str, limit: int = 700) -> str:

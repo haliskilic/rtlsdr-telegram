@@ -40,6 +40,7 @@ class SchedState:
     current_since: float = 0.0
     next_target: str = ""
     next_info: str = ""
+    next_pass_info: str = ""
     device_present: bool = False
     last_device_note: float = 0.0
 
@@ -128,6 +129,7 @@ class Scheduler:
             "current_freq": s.current_freq_text,
             "current_since_s": (time.time() - s.current_since) if s.current_since else 0,
             "next_target": s.next_target, "next_info": s.next_info,
+            "next_pass_info": s.next_pass_info,
             "device_present": s.device_present,
             "muted": sorted(self.muted),
             "boosts": {k: max(0, int(v - time.time())) for k, v in self.boosts.items() if v > time.time()},
@@ -177,8 +179,8 @@ class Scheduler:
         pass_action = self._pending_pass(now)
         # c) acil durum hedefi (en yüksek öncelik) — süresi geldiyse
         emerg = self.by_key.get("emergency")
-        emerg_due = emerg and emerg.enabled and not self.is_muted(emerg.CATEGORY) and emerg.wants_slot(now) \
-            and self.sdr  # device zaten kontrol edildi
+        emerg_due = bool(emerg and emerg.enabled and not self.is_muted(emerg.CATEGORY)
+                         and emerg.check_tools() and emerg.wants_slot(now))
         # Öncelik: Acil > uydu geçişi > boost > normal
         # Ancak aktif (şu an içinde) geçiş acil durumla yarışırsa: kısa acil kontrolünü araya sıkıştır.
         if emerg_due and not (pass_action and pass_action[2] == "active"):
@@ -200,15 +202,25 @@ class Scheduler:
         for t in self.targets:
             if not t.enabled or self.is_muted(t.CATEGORY):
                 continue
-            if t.CLASS == "waiting":
-                continue  # yalnız pencere içinde
+            if t.CLASS == "pass":
+                continue  # uydu/ISS: yalnız TLE penceresinde (_pending_pass)
             if not t.needs_device():
                 continue  # cihaz gerektirmeyen (auto_rx) ayrı ele alınır
+            if not t.check_tools():
+                continue  # aracı olmayan hedef döngüde yer kaplamasın
             overdue = now - (t.last_run + t.period_s)
-            if overdue >= 0:
-                candidates.append((t.priority, -overdue, t))
+            if overdue < 0:
+                continue
+            # Gecikmeyi periyoda ORANLA: mutlak saniye kullanılırsa hiç çalışmamış
+            # (last_run=0) hedefler arasında periyodu en kısa olan hep "en gecikmiş"
+            # görünür ve uzun periyotlular (AIS/ACARS/radyosonda) açlığa düşer.
+            if t.last_run <= 0:
+                lateness = float("inf")           # hiç çalışmadı: ilk tur garantili
+            else:
+                lateness = overdue / max(1.0, t.period_s)
+            candidates.append((t.priority, -lateness if lateness != float("inf") else -1e18, t))
         if candidates:
-            candidates.sort(key=lambda x: (x[0], x[1]))
+            candidates.sort(key=lambda x: (x[0], x[1]))   # kararlı sıralama: eşitlikte config sırası
             self._set_next(candidates)
             return ("target", candidates[0][2], "normal")
         # f) cihaz gerektirmeyen hedefler (radiosonde auto_rx) — boşta çalıştır
@@ -221,9 +233,9 @@ class Scheduler:
         """En yakın uydu/ISS geçişini döndürür: (rise, target, 'active'|'soon') ya da None."""
         best = None
         for t in self.targets:
-            if t.CLASS != "waiting" or not t.enabled or self.is_muted(t.CATEGORY):
+            if t.CLASS != "pass" or not t.enabled or self.is_muted(t.CATEGORY):
                 continue
-            if not hasattr(t, "next_window"):
+            if not t.check_tools():
                 continue
             win = t.next_window(now)
             if not win:
@@ -233,9 +245,10 @@ class Scheduler:
                 return (rise, t, "active")
             if best is None or rise < best[0]:
                 best = (rise, t, "soon")
-                self.state.next_target = t.KEY
-                self.state.next_info = f"{t.display_name()} geçişi {self._fmt_eta(rise - now)}"
-        # yaklaşan ama henüz pencerede değil — bekleme eylemi döndürme (normal döngü dönsün)
+        if best:
+            self.state.next_pass_info = f"{best[1].display_name()} geçişi {self._fmt_eta(best[0] - now)}"
+        else:
+            self.state.next_pass_info = ""
         return None
 
     def _set_next(self, candidates):
@@ -273,7 +286,7 @@ class Scheduler:
         try:
             with self.sdr.lease(target.KEY):
                 self.sdr.note_device_ok()
-                target.run_slot(self._combined_stop(), duration)
+                target.run_slot(self._slot_stop, duration)
         except Exception as e:
             self.log.exception("hedef '%s' çöktü: %s", target.KEY, e)
             try:
@@ -290,13 +303,14 @@ class Scheduler:
         self.state.current_freq_text = f"{req.freq_mhz:.4f} MHz ({req.mode.upper()})"
         self.state.current_since = time.time()
         self._slot_stop.clear()
-        from .events import Event, Category, Attachment
+        from .events import Event, Category
         from .channel_maps import describe
+        from .targets.base import audio_attachment
         try:
             with self.sdr.lease("adhoc"):
                 recorder = self._recorder
                 freq_hz = int(req.freq_mhz * 1e6)
-                segs = recorder.record_window(freq_hz, req.seconds, self._combined_stop(),
+                segs = recorder.record_window(freq_hz, req.seconds, self._slot_stop,
                                               mode=req.mode, audio_rate=16000, threshold_dbfs=-46.0,
                                               hangover_s=1.5, min_segment_s=0.5, max_segment_s=req.seconds,
                                               gain=self.sdr.gain, channel=None, prefix="adhoc",
@@ -318,10 +332,10 @@ class Scheduler:
                        summary=f"{band} — {seg.duration_s:.0f} sn yayın",
                        signal=f"{seg.peak_dbfs:.1f} dBFS (tepe)", signal_value=seg.peak_dbfs,
                        duration_s=seg.duration_s, priority=4,
-                       attachments=[Attachment("voice", seg.final_path, caption=band)])
+                       attachments=[audio_attachment(seg.final_path, caption=band)])
             ev.transcript_status = "pending"
             ev.reply_to = req.reply
-            self.dispatcher.submit(ev)
+            self._submit(ev)
 
     def _duration_for(self, target, reason) -> float:
         if reason == "uydu":
@@ -331,18 +345,33 @@ class Scheduler:
                 return max(self.min_slot_s, min(sett - time.time(), sett - rise) + 5)
         return max(self.min_slot_s, target.dwell_s)
 
-    def _combined_stop(self) -> threading.Event:
-        # slot-stop ya da global-stop tetiklenince uyanan birleşik olay
-        ev = threading.Event()
-
-        def watch():
-            while not ev.is_set():
-                if self._stop.is_set() or self._slot_stop.is_set():
-                    ev.set()
-                    return
-                time.sleep(0.2)
-        threading.Thread(target=watch, daemon=True).start()
-        return ev
-
-    # recorder main tarafından atanır (ad-hoc için)
+    # main tarafından atanır: ad-hoc kayıt ve transkripsiyon yönlendirmesi
     _recorder = None
+    tworker = None
+
+    def _submit(self, ev):
+        """Ses ekli olayları transkripsiyon işçisine, diğerlerini doğrudan kuyruğa ver."""
+        if self.tworker is not None and ev.needs_transcription:
+            self.tworker.submit(ev)
+        else:
+            self.dispatcher.submit(ev)
+
+    # ------------------------------------------------------ geçiş listesi
+    def upcoming_passes(self, hours: float = 24, limit: int = 8) -> list:
+        """/gecisler için: etkin 'pass' hedeflerinin uydularına göre yaklaşan geçişler."""
+        sats = []
+        pred = None
+        for t in self.targets:
+            if t.CLASS != "pass" or not t.enabled:
+                continue
+            pred = pred or getattr(t, "predictor", None)
+            if t.KEY == "iss":
+                sats.append({"norad": t.conf.get("norad", 25544), "name": "ISS",
+                             "min_elevation": t.conf.get("min_elevation", 10)})
+            else:
+                for sd in t.conf.get("satellites", []):
+                    sats.append({"norad": sd["norad"], "name": sd["name"],
+                                 "min_elevation": t.conf.get("min_elevation", 10)})
+        if not pred or not getattr(pred, "available", False) or not sats:
+            return []
+        return pred.upcoming(sats, hours=hours, limit=limit)

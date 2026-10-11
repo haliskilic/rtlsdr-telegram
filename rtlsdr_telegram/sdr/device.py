@@ -67,6 +67,10 @@ class SdrManager:
         self.info: DeviceInfo | None = None
         self._probe_ts = 0.0
         self._probe_ttl = 30.0
+        # Ardışık açılışlar arasında libusb'nin aygıtı bırakması için asgari boşluk.
+        # Aksi halde bir sonraki araç "usb_claim_interface error -6" alır.
+        self._last_release = 0.0
+        self.release_gap_s = 1.0
         # Harici araç yolları
         self.bin_rtl_test = which("rtl_test")
         self.bin_rtl_fm = which("rtl_fm")
@@ -104,6 +108,7 @@ class SdrManager:
                 time.sleep(0.1)
         finally:
             proc.stop(timeout=2)
+            self._last_release = time.time()
         text = "\n".join(lines)
         self._probe_ts = time.time()
         m = re.search(r"Found (\d+) device", text)
@@ -146,20 +151,34 @@ class SdrManager:
         while True:
             with self._lock:
                 if self._owner is None:
-                    self._owner = owner
-                    self._owner_since = time.time()
-                    return
-                if self._owner == owner:
+                    gap = self.release_gap_s - (time.time() - self._last_release)
+                    if gap <= 0:
+                        self._owner = owner
+                        self._owner_since = time.time()
+                        return
+                elif self._owner == owner:
                     return
             if time.time() > deadline:
                 raise SdrError(f"dongle '{self._owner}' tarafından tutuluyor, '{owner}' alamadı")
-            time.sleep(0.2)
+            time.sleep(0.1)
 
     def _release(self, owner: str) -> None:
         with self._lock:
             if self._owner == owner:
                 self._owner = None
                 self._owner_since = 0.0
+                self._last_release = time.time()
+
+    def mark_released(self) -> None:
+        """Dongle kullanan bir alt süreç durduruldu — boşluk sayacını yenile."""
+        self._last_release = time.time()
+
+    def wait_ready(self) -> None:
+        """Aynı slot içinde ardışık araçlar arasında (rtl_power → rtl_fm gibi) libusb'nin
+        aygıtı bırakması için asgari boşluğu bekler."""
+        gap = self.release_gap_s - (time.time() - self._last_release)
+        if gap > 0:
+            time.sleep(gap)
 
     @property
     def current_owner(self) -> str | None:
@@ -175,9 +194,13 @@ class SdrManager:
 
     def gain_args(self, gain=None, flag: str = "-g") -> list[str]:
         g = self.gain if gain is None else gain
-        if g in (None, "auto", "agc", -1, "-1"):
+        if g is None or str(g).strip().lower() in ("auto", "agc", "-1", ""):
             return []
         return [flag, str(g)]
+
+    @staticmethod
+    def is_auto_gain(g) -> bool:
+        return g is None or str(g).strip().lower() in ("auto", "agc", "-1", "")
 
     # ---------------------------------------------------------- rtl_power
     def power_scan(self, start_hz: int, end_hz: int, bin_hz: int, *, integration: str = "1",
@@ -185,6 +208,7 @@ class SdrManager:
         """rtl_power sürecini başlatır (CSV stdout). Çağıran satırları ayrıştırır."""
         if not self.bin_rtl_power:
             raise SdrError("rtl_power bulunamadı")
+        self.wait_ready()
         cmd = [self.bin_rtl_power, "-f", f"{start_hz}:{end_hz}:{bin_hz}", "-i", str(integration),
                "-p", str(self.ppm)] + self.gain_args(gain)
         if crop:

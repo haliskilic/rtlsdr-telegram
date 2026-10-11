@@ -18,7 +18,7 @@ import threading
 import time
 
 from ..events import Category, Attachment, PRIO_EMERGENCY
-from .base import TargetBase
+from .base import TargetBase, audio_attachment
 
 
 class EmergencyTarget(TargetBase):
@@ -26,7 +26,8 @@ class EmergencyTarget(TargetBase):
     CATEGORY = Category.ACIL
     CLASS = "opportunistic"
     DEFAULTS = {
-        "enabled": True, "priority": 0, "dwell_s": 30, "period_s": 120,
+        "enabled": True, "priority": 0, "dwell_s": 35, "period_s": 240,
+        "dwell_406_s": 25, "dwell_121_s": 10,
         "gain": 40,
         "watch_406": True, "band_406": [406.0, 406.1], "threshold_406_db": 15.0,
         "watch_121_5": True, "freq_121_5_mhz": 121.5, "threshold_121_5_dbfs": -35.0,
@@ -46,14 +47,19 @@ class EmergencyTarget(TargetBase):
             tasks.append("121")
         if not tasks:
             return
-        share = duration_s / len(tasks)
+        # 406 MHz vericileri ~50 sn'de bir 0.5 sn yayın yapar; sürekli (one-shot değil)
+        # tarama ile yakalama olasılığı artar. Süre: dwell_406_s + dwell_121_s.
+        d406 = float(self.conf.get("dwell_406_s", 25))
+        d121 = float(self.conf.get("dwell_121_s", 10))
+        total = d406 + d121 if ("406" in tasks and "121" in tasks) else duration_s
+        scale = min(1.0, duration_s / total) if total > 0 else 1.0
         for t in tasks:
             if stop_event.is_set():
                 break
             if t == "406":
-                self._scan_406(stop_event, share)
+                self._scan_406(stop_event, d406 * scale if "121" in tasks else duration_s)
             else:
-                self._watch_121_5(stop_event, share)
+                self._watch_121_5(stop_event, d121 * scale if "406" in tasks else duration_s)
 
     # ------------------------------------------------------------- 406 MHz
     def _scan_406(self, stop_event, secs):
@@ -74,31 +80,37 @@ class EmergencyTarget(TargetBase):
             for i, v in enumerate(vals):
                 rows.append((f_low + i * step, v))
 
+        try:
+            proc = self.sdr.power_scan(start, end, 2000, integration="1",
+                                       gain=self.conf.get("gain", 40), oneshot=False,
+                                       log_path=self.cfg.log_dir / "emerg406.log")
+        except Exception as e:
+            self.log_error(f"406 tarama kurulamadı: {e}")
+            return
+        proc.on_line = on_line
         deadline = time.time() + secs
-        while time.time() < deadline and not stop_event.is_set():
-            rows.clear()
+        try:
+            proc.start()
+            while time.time() < deadline and proc.running and not stop_event.is_set():
+                stop_event.wait(0.5)
+        finally:
+            proc.stop()
             try:
-                proc = self.sdr.power_scan(start, end, 2000, integration="1",
-                                           gain=self.conf.get("gain", 40), oneshot=True,
-                                           log_path=self.cfg.log_dir / "emerg406.log")
-            except Exception as e:
-                self.log_error(f"406 tarama kurulamadı: {e}")
-                return
-            proc.on_line = on_line
-            try:
-                proc.start()
-                t0 = time.time()
-                while time.time() - t0 < 4 and proc.running and not stop_event.is_set():
-                    stop_event.wait(0.3)
-            finally:
-                proc.stop()
-            if rows:
-                vals = [v for _, v in rows]
-                med = sorted(vals)[len(vals) // 2]
-                fpk, vpk = max(rows, key=lambda x: x[1])
-                if vpk - med >= thr:
-                    self._alarm("406", round(fpk / 1e6, 4), f"+{vpk - med:.0f} dB taban üstü", vpk)
-            stop_event.wait(1.0)
+                self.sdr.mark_released()
+            except Exception:
+                pass
+        if not rows:
+            return
+        # bin başına tepe tutma (max-hold): kısa patlamalar ortalamada kaybolmasın
+        peak_by_f: dict[float, float] = {}
+        for f, v in rows:
+            if v > peak_by_f.get(f, -999):
+                peak_by_f[f] = v
+        vals = sorted(peak_by_f.values())
+        med = vals[len(vals) // 2]
+        fpk, vpk = max(peak_by_f.items(), key=lambda x: x[1])
+        if vpk - med >= thr:
+            self._alarm("406", round(fpk / 1e6, 4), f"+{vpk - med:.0f} dB taban üstü (tepe)", vpk)
 
     # ----------------------------------------------------------- 121.5 MHz
     def _watch_121_5(self, stop_event, secs):
@@ -121,10 +133,14 @@ class EmergencyTarget(TargetBase):
         above = 0.0
         deadline = time.time() + secs
         try:
-            while time.time() < deadline and not stop_event.is_set() and proc.running:
-                block = proc.read_stdout_bytes(int(bps * 0.2))
-                if not block:
-                    time.sleep(0.02)
+            while time.time() < deadline and not stop_event.is_set():
+                block = proc.read_stdout_bytes(int(bps * 0.2), timeout=0.5)
+                if block == b"":
+                    break
+                if block is None:
+                    above = max(0.0, above - 0.2)
+                    if not proc.running:
+                        break
                     continue
                 lvl = _rms_dbfs(block)
                 if lvl >= thr:
@@ -137,6 +153,10 @@ class EmergencyTarget(TargetBase):
                     above = max(0.0, above - 0.1)
         finally:
             proc.stop()
+            try:
+                self.sdr.mark_released()
+            except Exception:
+                pass
 
     def _alarm_121(self, freq_hz, lvl, stop_event):
         atts = []
@@ -148,7 +168,7 @@ class EmergencyTarget(TargetBase):
                                             gain=self.conf.get("gain", 40), prefix="emerg121",
                                             require_dynamics=False)
             for s in segs:
-                atts.append(Attachment("voice", s.final_path, caption="121.5 MHz kaydı"))
+                atts.append(audio_attachment(s.final_path, caption="121.5 MHz kaydı"))
                 dur += s.duration_s
         self._alarm("121", round(freq_hz / 1e6, 4), f"{lvl:.1f} dBFS", lvl, attachments=atts, duration=dur)
 

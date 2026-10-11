@@ -12,7 +12,7 @@ import json
 import threading
 
 from ..events import Category
-from .base import TargetBase
+from .base import TargetBase, SlotCollector
 
 # rtl_433 alan adı -> okunur etiket
 FIELD_LABELS = {
@@ -38,6 +38,8 @@ class ISMTarget(TargetBase):
         "freqs_mhz": [433.92, 868.0], "hop_s": 30, "gain": "auto",
         "band_label": "433.92 / 868 MHz ISM", "report_readings": False,
         "report_new": True,
+        "individual_max": 2,      # bu sayıya kadar yeni cihaz ayrı mesaj, fazlası tek özet
+        "summary_list_max": 15,
     }
 
     def tools_available(self):
@@ -59,7 +61,13 @@ class ISMTarget(TargetBase):
             cmd += ["-g", str(gain)]
         if self.sdr.ppm:
             cmd += ["-p", str(self.sdr.ppm)]
+        self._collector = SlotCollector(self, "ISM Yeni Cihazlar",
+                                        individual_max=int(self.conf.get("individual_max", 2)),
+                                        list_max=int(self.conf.get("summary_list_max", 15)))
+        self._slot_seen: set[str] = set()
         self.run_tool_lines(cmd, stop_event, duration_s, self._on_line, name="rtl_433", log_name="rtl_433")
+        self._collector.flush(freq_mhz=None, summary_prefix="Yeni cihaz: ",
+                              extra_body=f"Bu slotta {len(self._slot_seen)} farklı cihaz duyuldu.")
 
     def _on_line(self, line: str):
         line = line.strip()
@@ -79,9 +87,10 @@ class ISMTarget(TargetBase):
 
         readings = self._format_readings(d)
         kind = self._classify(model, d)
+        self._slot_seen.add(key)
         if not is_new and not self.conf.get("report_readings", False):
             return
-        if is_new is False and not readings:
+        if not is_new and not readings:
             return
 
         body = [f"Model      : {model}", f"Kimlik     : {dev_id}"]
@@ -97,7 +106,12 @@ class ISMTarget(TargetBase):
             signal=(f"{rssi:.1f} dBFS" if isinstance(rssi, (int, float)) else None),
             signal_value=rssi if isinstance(rssi, (int, float)) else None,
             dedup_key=f"ism-{key}" if is_new else None)
-        self.emit(ev)
+        if is_new:
+            # yeni cihazlar slot sonunda toplu/ayrı gönderilir (sel koruması)
+            line = f"• {kind}: {model} #{dev_id}" + (f" ({readings[0].split(':')[-1].strip()})" if readings else "")
+            self._collector.add(line, ev, sort_key=float(rssi) if isinstance(rssi, (int, float)) else -99)
+        else:
+            self.emit(ev)
 
     def _classify(self, model: str, d: dict) -> str:
         m = model.lower()

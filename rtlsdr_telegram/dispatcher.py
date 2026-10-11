@@ -44,6 +44,7 @@ class Dispatcher:
         self.online = True
         self.sent_count = 0
         self.transcriber = None  # main tarafından atanır
+        self.scheduler = None    # main tarafından atanır (susturma kontrolü için)
 
     # ----------------------------------------------------------- yaşam döngüsü
     def start(self) -> None:
@@ -81,7 +82,11 @@ class Dispatcher:
                 if gap > 0:
                     self._stop.wait(gap)
             try:
-                self._send_event(ev)
+                if self._muted(ev):
+                    self.log.debug("susturulmuş kategori, atlandı: %s", ev.category.value)
+                    self.st.queue_ack(qid)
+                    continue
+                self._send_event(ev, qid)
                 self.st.queue_ack(qid)
                 self.st.mark_sent(ev.db_id)
                 self._last_send = time.time()
@@ -112,42 +117,71 @@ class Dispatcher:
             return ev.silent
         return ev.priority >= self.quiet_priority_from
 
-    def _send_event(self, ev: Event) -> None:
+    def _muted(self, ev: Event) -> bool:
+        """Susturulmuş kategori: acil (öncelik 0) her zaman geçer."""
+        if ev.priority <= PRIO_EMERGENCY or ev.category == Category.SISTEM:
+            return False
+        sch = self.scheduler
+        try:
+            return bool(sch and sch.is_muted(ev.category))
+        except Exception:
+            return False
+
+    def _send_event(self, ev: Event, qid: int | None = None) -> None:
         silent = self._silent(ev)
         chat = ev.reply_to["chat_id"] if ev.reply_to else self.chat_id
         thread = (ev.reply_to.get("message_thread_id") if ev.reply_to else self.thread_id)
         reply_to = ev.reply_to.get("message_id") if ev.reply_to else None
 
-        text = ev.to_html(self.tz, self.station_lat, self.station_lon)
-        msg_ids = self.client.send_message(chat, text, thread_id=thread, reply_to=reply_to, silent=silent)
-        anchor = msg_ids[0] if msg_ids else None
+        # Kısmi ilerleme: metin daha önce gönderildiyse (ek yüklemesi başarısız olup
+        # yeniden denendiğinde) metni tekrar göndermeyiz — çift mesaj önlenir.
+        anchor = ev.extra.get("_anchor_msg_id") if ev.extra else None
+        if not anchor:
+            text = ev.to_html(self.tz, self.station_lat, self.station_lon)
+            msg_ids = self.client.send_message(chat, text, thread_id=thread, reply_to=reply_to, silent=silent)
+            anchor = msg_ids[0] if msg_ids else None
+            if anchor and qid is not None and ev.attachments:
+                ev.extra["_anchor_msg_id"] = anchor
+                try:
+                    self.st._exec("UPDATE queue SET event_json=? WHERE id=?", (ev.to_json(), qid))
+                except Exception:
+                    pass
 
-        for att in ev.attachments:
+        done = set(ev.extra.get("_sent_atts", [])) if ev.extra else set()
+        for i, att in enumerate(ev.attachments):
+            if i in done:
+                continue
             if not att.path or not os.path.exists(att.path):
                 self.log.warning("ek dosyası bulunamadı: %s", att.path)
                 continue
             cap = att.caption
-            try:
-                if att.kind == "voice":
-                    self.client.send_voice(chat, att.path, caption=cap, thread_id=thread,
-                                           reply_to=anchor, silent=True)
-                elif att.kind == "audio":
-                    self.client.send_audio(chat, att.path, caption=cap, thread_id=thread,
-                                           reply_to=anchor, silent=True)
-                elif att.kind == "photo":
-                    self.client.send_photo(chat, att.path, caption=cap, thread_id=thread,
-                                           reply_to=anchor, silent=True)
-                else:
-                    self.client.send_document(chat, att.path, caption=cap, thread_id=thread,
-                                              reply_to=anchor, silent=True)
-            except TelegramError:
-                raise
-            finally:
-                if att.delete_after:
-                    try:
-                        os.unlink(att.path)
-                    except OSError:
-                        pass
+            if att.kind == "voice":
+                self.client.send_voice(chat, att.path, caption=cap, thread_id=thread, reply_to=anchor, silent=True)
+            elif att.kind == "audio":
+                self.client.send_audio(chat, att.path, caption=cap, thread_id=thread, reply_to=anchor, silent=True)
+            elif att.kind == "photo":
+                try:
+                    self.client.send_photo(chat, att.path, caption=cap, thread_id=thread, reply_to=anchor, silent=True)
+                except TelegramError as e:
+                    if e.transient:
+                        raise
+                    # fotoğraf reddedilirse (boyut/oran) belge olarak gönder
+                    self.client.send_document(chat, att.path, caption=cap, thread_id=thread, reply_to=anchor, silent=True)
+            else:
+                self.client.send_document(chat, att.path, caption=cap, thread_id=thread, reply_to=anchor, silent=True)
+            # başarı: ilerlemeyi kaydet, geçici dosyayı ancak şimdi sil
+            done.add(i)
+            if qid is not None and len(ev.attachments) > 1:
+                ev.extra["_sent_atts"] = sorted(done)
+                try:
+                    self.st._exec("UPDATE queue SET event_json=? WHERE id=?", (ev.to_json(), qid))
+                except Exception:
+                    pass
+            if att.delete_after:
+                try:
+                    os.unlink(att.path)
+                except OSError:
+                    pass
 
     # ---------------------------------------------------- doğrudan metin (komut yanıtı)
     def send_text(self, text: str, *, chat_id=None, thread_id=None, reply_to=None, silent=True) -> None:

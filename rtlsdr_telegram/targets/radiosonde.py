@@ -33,7 +33,7 @@ class RadiosondeTarget(TargetBase):
     DEFAULTS = {
         "enabled": True, "priority": 4, "dwell_s": 45, "period_s": 600,
         "scan_start_mhz": 400.0, "scan_end_mhz": 406.0, "bin_khz": 5,
-        "detect_threshold_db": 12.0, "gain": "auto",
+        "detect_threshold_db": 12.0, "gain": "auto", "carrier_repeat_min": 180,
         "band_label": "400–406 MHz radyosonda",
         "auto_rx": {"enabled": False, "log_dir": "", "manage": False, "descent_rate_landing": True},
     }
@@ -98,13 +98,21 @@ class RadiosondeTarget(TargetBase):
         peaks = [(f, v) for f, v in rows if v - med >= thr]
         peaks.sort(key=lambda x: -x[1])
         reported = set()
+        repeat_s = float(self.conf.get("carrier_repeat_min", 180)) * 60
         for f_hz, v in peaks[:3]:
             f_mhz = round(f_hz / 1e6, 3)
             bucket = round(f_mhz, 2)
             if bucket in reported:
                 continue
             reported.add(bucket)
+            prev = self.st.registry_get("sonde_carrier", f"{bucket:.2f}")
             is_new, _, _ = self.registry_touch("sonde_carrier", f"{bucket:.2f}", {"db": round(v - med, 1)})
+            # Aynı kalıcı taşıyıcı (pager/telemetri olabilir) her slotta tekrar bildirilmesin
+            if not is_new and prev and (time.time() - float(prev["data"].get("reported", 0))) < repeat_s:
+                continue
+            d = (prev["data"] if prev else {})
+            d.update({"reported": time.time(), "db": round(v - med, 1)})
+            self.st.registry_set_data("sonde_carrier", f"{bucket:.2f}", d)
             ev = self.make_event(
                 "Radyosonda Taşıyıcı (aday)",
                 summary=f"{f_mhz:.3f} MHz'de güçlü taşıyıcı (+{v - med:.0f} dB) — radyosonda olabilir",

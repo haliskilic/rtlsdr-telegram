@@ -5,7 +5,9 @@ satır satır çıktı okuyan, çökerse kontrollü kapanan, log dosyasına yaza
 """
 from __future__ import annotations
 
+import collections
 import os
+import queue
 import signal
 import subprocess
 import threading
@@ -48,6 +50,11 @@ class ManagedProcess:
         self._stop = threading.Event()
         self.started_at = 0.0
         self._logfh = None
+        # ikili (binary) stdout için zaman aşımılı okuma kuyruğu
+        self._bin_q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=256)
+        self._bin_chunk = 4096
+        # son stderr satırları (cihaz açma hatası tespiti için)
+        self.stderr_tail: "collections.deque[str]" = collections.deque(maxlen=30)
 
     def start(self) -> None:
         self._stop.clear()
@@ -72,8 +79,10 @@ class ManagedProcess:
         self.started_at = time.time()
         if self.text_stdout:
             t = threading.Thread(target=self._pump_stdout, daemon=True, name=f"{self.name}-out")
-            t.start()
-            self._threads.append(t)
+        else:
+            t = threading.Thread(target=self._pump_binary, daemon=True, name=f"{self.name}-bin")
+        t.start()
+        self._threads.append(t)
         t2 = threading.Thread(target=self._pump_stderr, daemon=True, name=f"{self.name}-err")
         t2.start()
         self._threads.append(t2)
@@ -101,6 +110,7 @@ class ManagedProcess:
                     break
                 line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
                 line = line.rstrip("\n")
+                self.stderr_tail.append(line)
                 if self._logfh:
                     self._logfh.write(line + "\n")
                     self._logfh.flush()
@@ -112,10 +122,49 @@ class ManagedProcess:
         except (ValueError, OSError):
             pass
 
-    def read_stdout_bytes(self, size: int) -> bytes:
-        """Ham ikili stdout okuması (text_stdout=False gerektirir)."""
+    def _pump_binary(self) -> None:
+        """İkili stdout'u parçalar halinde kuyruğa akıtır (okuyucu bloklanmasın)."""
         assert self.proc and self.proc.stdout
-        return self.proc.stdout.read(size)
+        try:
+            while not self._stop.is_set():
+                chunk = self.proc.stdout.read(self._bin_chunk)
+                if not chunk:
+                    break
+                try:
+                    self._bin_q.put(chunk, timeout=2)
+                except queue.Full:
+                    # tüketici yavaş; en eskiyi at (gerçek zamanlı ses için kabul edilebilir)
+                    try:
+                        self._bin_q.get_nowait()
+                    except queue.Empty:
+                        pass
+        except (ValueError, OSError):
+            pass
+        finally:
+            try:
+                self._bin_q.put_nowait(None)  # EOF işareti
+            except queue.Full:
+                pass
+
+    def read_stdout_bytes(self, size: int, timeout: float = 0.5) -> bytes | None:
+        """İkili stdout'tan en fazla `size` bayt okur; `timeout` içinde veri yoksa None.
+
+        Süreç sustuğunda (örn. squelch kapalıyken rtl_fm) çağıran bloklanmaz;
+        None 'veri yok' demektir, b'' ise EOF (süreç bitti)."""
+        buf = bytearray()
+        deadline = time.time() + timeout
+        while len(buf) < size:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                chunk = self._bin_q.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if chunk is None:
+                return bytes(buf) if buf else b""
+            buf += chunk
+        return bytes(buf) if buf else None
 
     @property
     def running(self) -> bool:
@@ -172,6 +221,26 @@ class ManagedProcess:
             except (ValueError, OSError):
                 pass
             self._logfh = None
+
+
+DEVICE_ERROR_MARKERS = ("usb_claim_interface", "Failed to open rtlsdr device", "usb_open error",
+                        "No supported devices found", "Device or resource busy")
+
+
+def looks_like_device_error(lines: Iterable[str]) -> bool:
+    """stderr satırlarında dongle açılamadı/meşgul belirtisi var mı?"""
+    for ln in lines:
+        for m in DEVICE_ERROR_MARKERS:
+            if m in ln:
+                return True
+    return False
+
+
+def shell_pipeline(pipeline: str) -> list[str]:
+    """Boru içeren bir komut dizgesini platforma uygun kabukla çalıştırmak için argv üretir."""
+    if os.name == "nt":
+        return ["cmd", "/c", pipeline]
+    return ["bash", "-c", pipeline]
 
 
 def run_capture(cmd: Iterable[str], timeout: float = 30, env: dict | None = None) -> tuple[int, str, str]:

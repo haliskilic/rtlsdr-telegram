@@ -15,6 +15,7 @@ Environment=PATH=/opt/rtlsdr-telegram/venv/bin:/usr/local/sbin:/usr/local/bin:/u
 ExecStart=/opt/rtlsdr-telegram/venv/bin/python /opt/rtlsdr-telegram/run.py -c /opt/rtlsdr-telegram/config.yaml
 Restart=always
 RestartSec=10
+TimeoutStopSec=25
 # Kaynak sınırları (Pi'de düşürülebilir)
 Nice=5
 # Günlükler journald + dosya (logs/)

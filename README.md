@@ -68,7 +68,11 @@ kayıtları **otomatik yazıya döken** modüler bir izleme sistemi.
   geçer, hata loglanır (`logs/errors.log`). Ağ kesilince mesajlar SQLite kuyrukta
   tutulur, bağlantı gelince gönderilir.
 - **Tek dongle** bir muteks (lease) ile paylaşılır; zamanlayıcı kime ne kadar
-  süre vereceğine öncelik kurallarıyla karar verir.
+  süre vereceğine öncelik kurallarıyla karar verir. Ardışık açılışlar arasında
+  ~1 sn boşluk bırakılır (libusb aygıtı bırakmadan "usb_claim" hatası alınmasın).
+- Hedef sınıfları: `waiting` (frekansta süre ayıran ADS-B/AIS/ACARS/radyosonda —
+  normal döngüde uzun dwell), `opportunistic` (fırsatçı), `pass` (yalnız TLE
+  penceresinde: Meteor-M, ISS).
 
 ### Neden bu araçlar?
 | Hedef | Araç | Gerekçe |
@@ -188,11 +192,29 @@ aktif/pasif, frekans, dinleme süresi, eşik/squelch, öncelik; transkripsiyon
 motoru ve dili; günlük özet saati; kara liste (FM/TV dahil); istasyon konumu
 (uydu hesapları için); platform.
 
-Kontrol komutu:
+Kontrol komutları:
 ```bash
-python run.py --check -c config.yaml        # yapılandırma + araç + dongle durumu
-python run.py --test-telegram -c config.yaml # Telegram bağlantı testi
+python run.py --check -c config.yaml           # yapılandırma + araç + dongle durumu
+python run.py --test-telegram -c config.yaml   # Telegram bağlantı testi
+python tools/telegram_ids.py <BOT_TOKEN>       # grup/topic/yönetici kimliklerini bul
 ```
+
+### Sel (flood) koruması
+Yoğun ortamlarda (havalimanı yakını, Marmara gemi trafiği, şehir içi ISM) her
+tespit için ayrı mesaj topic'i boğar. Varsayılanlar buna göre ayarlıdır:
+- **ADS-B / AIS:** `report_mode: summary` — slot sonunda tek özet (en yakınlar
+  listesiyle). Yalnız acil squawk, AIS-SART ve `report_nearby_km` içindeki
+  yeni/alçak hedefler ayrı mesaj alır. `each` kipi her yeni hedefi bildirir.
+- **ISM:** yeni cihazlar slot başına `individual_max` adede kadar ayrı, fazlası tek özet.
+- **ACARS/VDL2:** slot başına `max_events_per_slot`, fazlası özet.
+- **Spektrum / radyosonda taşıyıcı:** aynı sinyal `repeat_min` dolmadan tekrar bildirilmez.
+
+### Ses bantlarında bant taraması
+Ses hedefleri slot başında `scan_ranges` aralıklarını rtl_power ile süpürür,
+taban gürültüsünün `scan_threshold_db` üstündeki kanalları öne alıp dinler;
+sabit `channels` listesi her zaman korunur. FM statiği (düz seviyeli ses)
+`require_dynamics` kapısıyla reddedilir; sürekli tonlar (121.5 ELT, ISS SSTV,
+`/tara`) bu kapıdan muaftır.
 
 ---
 
@@ -210,6 +232,7 @@ Yalnızca `telegram.admins` listesindeki kullanıcılar çalıştırabilir.
 | `/oncelik <hedef>` | hedefi tarama döngüsünde öne al |
 | `/ozet` | günlük özeti hemen üret |
 | `/kayitlar <n>` | son n ses kaydını yeniden gönder |
+| `/gecisler [saat]` | yaklaşan Meteor-M / ISS geçişleri |
 | `/yardim` | komut listesi |
 
 ---
@@ -262,6 +285,12 @@ ve bunu bildirir; dongle takılınca otomatik devam eder.
   hedefleri `enabled: false` yapın.
 - **Yetkisiz komut**: `telegram.admins` listesine kendi kullanıcı kimliğinizi
   ekleyin (`/durum` yetkisiz denemede kimliğinizi yazar; @userinfobot da verir).
+- **Topic çok mesaj alıyor**: `report_mode: summary` (varsayılan) açık mı?
+  `report_nearby_km` küçültün, `individual_max` azaltın ya da `/sustur <kategori>`.
+- **FM ses hedefleri statik kaydediyor**: anten zayıf olabilir; `min_dynamics_db`
+  artırın (3–4), `threshold_dbfs` yükseltin veya rtl_fm `squelch` kalibre edin.
+- **Uydu geçişi hesaplanmıyor**: `data/tle/*.tle` oluşuyor mu? celestrak 5xx verirse
+  `tle_urls` sırasındaki ikinci kaynak (ivanstanojevic) kullanılır; `/gecisler` ile kontrol edin.
 - **Loglar**: `logs/rtlsdr-telegram.log` ve `logs/errors.log`; her araç için
   `logs/<araç>.log`.
 

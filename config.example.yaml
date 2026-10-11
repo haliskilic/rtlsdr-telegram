@@ -28,7 +28,8 @@ telegram:
   allow_private_admin_commands: true# yöneticiler bota özelden de komut verebilsin mi
   min_interval_s: 2.0               # mesajlar arası asgari süre (flood koruması)
   quiet_priority_from: 4            # bu öncelik ve üstü (sayıca) sessiz bildirim (acil her zaman sesli)
-  startup_message: true             # açılışta durum mesajı gönder
+  startup_message: true             # açılışta/kapanışta durum mesajı gönder
+  heartbeat_hours: 0                # >0 ise bu kadar saatte bir kısa "yaşıyorum" mesajı
   proxy: ""                         # örn. "socks5://127.0.0.1:9050" (boş = doğrudan)
 
 # ------------------------------------------------------------------ SDR
@@ -113,10 +114,12 @@ targets:
   adsb:
     enabled: true
     priority: 3
-    dwell_s: 60
-    period_s: 180
+    dwell_s: 90
+    period_s: 300
     gain: auto
     low_alt_ft: 3000                # bu irtifanın altı "alçak uçuş" işaretlenir
+    report_mode: summary            # summary: slot sonunda tek özet (yoğun bölge için) | each: her yeni uçak ayrı
+    report_nearby_km: 8             # bu mesafedeki yeni/alçak uçaklar her kipte ayrı mesaj alır
 
   # 2) ACARS/VDL2 (uçak veri mesajları) — acarsdec + dumpvdl2
   acars:
@@ -129,8 +132,11 @@ targets:
   # 3) Gemi takibi (AIS) — AIS-catcher
   ais:
     enabled: true
-    dwell_s: 60
+    dwell_s: 90
     period_s: 300
+    report_mode: summary            # summary | each (Marmara gibi yoğun sularda summary önerilir)
+    report_nearby_km: 5             # yeni ve bu kadar yakın gemiler ayrı mesaj alır
+    # AIS-SART / MOB / EPIRB-AIS (MMSI 970/972/974) otomatik ACİL alarm üretir
 
   # 4) Radyosonda (400–406 MHz) — tespit + radiosonde_auto_rx telemetri
   radiosonde:
@@ -148,6 +154,7 @@ targets:
     period_s: 300
     freqs_mhz: [433.92, 868.0]
     report_readings: false          # true: her okumayı da bildir (çok mesaj üretir)
+    individual_max: 2               # slotta bu kadar yeni cihaza kadar ayrı mesaj; fazlası tek özet
 
   # 6) APRS (144.800 MHz) — multimon-ng
   aprs:
@@ -159,7 +166,9 @@ targets:
   emergency:
     enabled: true
     priority: 0
-    period_s: 120
+    period_s: 240
+    dwell_406_s: 25                 # 406 MHz sürekli tarama süresi (vericiler ~50 sn'de bir yayın yapar)
+    dwell_121_s: 10
     watch_406: true
     watch_121_5: true
     record_121_5: true
@@ -168,6 +177,7 @@ targets:
   gsm:
     enabled: true
     priority: 6
+    dwell_s: 240                    # grgsm_scanner tüm bandı ~dk'lar içinde tarar; kısa dwell eksik bırakır
     period_s: 3600
     bands: [GSM900, DCS1800]
 
@@ -178,6 +188,9 @@ targets:
     period_s: 300
     threshold_dbfs: -42             # VOX eşiği (dBFS); bu seviyeyi aşınca kayıt başlar
     # Aşağıdakiler tüm ses hedefleri için geçerli (amateur_voice/airband/marine_voice/cb_pmr):
+    # scan_ranges: [{start_mhz: 144.0, end_mhz: 146.0, step_khz: 12.5}]  # bant taraması; aktif kanallar öne alınır
+    # scan_threshold_db: 10         # taban gürültüsünün bu kadar üstü "aktif kanal"
+    # scan_max_channels: 3          # taramadan en fazla kaç kanal dinlensin
     # require_dynamics: true        # düz seviyeli (statik/taşıyıcı) segmentleri reddet
     # min_dynamics_db: 2.5          # konuşma dinamiği eşiği; artırmak statik gürültüyü daha çok eler
     # squelch: 0                    # rtl_fm donanım squelch (0=kapalı); antenle kalibre edilir
@@ -223,7 +236,7 @@ targets:
     gain: 42
     satellites:
       - {name: "METEOR-M2 3", norad: 57166, freq_mhz: 137.9, pipeline: "meteor_m2-x_lrpt"}
-      - {name: "METEOR-M2 4", norad: 59051, freq_mhz: 137.1, pipeline: "meteor_m2-x_lrpt"}
+      - {name: "METEOR-M2 4", norad: 59051, freq_mhz: 137.1, pipeline: "meteor_m2-x_lrpt_80k"}
 
   # 14) ISS (145.800/145.825 MHz) — geçişte ses/SSTV/paket
   iss:
@@ -240,7 +253,7 @@ targets:
     active: false                   # true: donanım var, dinlemeyi dene
     freq_mhz: 1541.45
     gain: 49
-    decoder_cmd: ""                 # JAERO/scytale çözücü komutu (boşsa kurulum notu üretir)
+    decoder_cmd: ""                 # örn. SatDump: "satdump live inmarsat_std_c /tmp/stdc --source rtlsdr --samplerate 1e6 --frequency {freq_hz} --gain {gain} --bias --timeout 600"
 
   # 16) Spektrum tarama ve anomali tespiti (24–1766 MHz, FM/TV hariç)
   spectrum:
@@ -250,4 +263,6 @@ targets:
     bin_khz: 25
     threshold_db: 10                # taban gürültüsünün bu kadar dB üstü = anomali
     learn_scans: 3                  # ilk N tarama "öğrenme" (alarm yok)
-    waterfall: true                 # anomali için şelale görüntüsü üret
+    waterfall: true                 # anomali için odaklı şelale görüntüsü üret
+    repeat_min: 60                  # aynı anomali en erken bu kadar dk sonra tekrar bildirilir
+    # Her slotta tek alt aralık (≈200 MHz) taranır; ~7 slotta tüm spektrum döner.

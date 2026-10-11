@@ -49,6 +49,7 @@ class SatellitePredictor:
         self._topos = None
         self._sats: dict[str, EarthSatellite] = {}
         self._tle_fail: dict[int, float] = {}
+        self._sat_loaded: dict[int, float] = {}
         if HAVE_SKYFIELD:
             self._ts = load.timescale()
             self._topos = wgs84.latlon(self.lat, self.lon, elevation_m=self.alt)
@@ -147,15 +148,22 @@ class SatellitePredictor:
         return None
 
     def _satellite(self, norad: int, name: str) -> "EarthSatellite | None":
+        """EarthSatellite nesnesini döndürür; TLE eskidiyse (tle_max_age_h) yeniler.
+
+        Önceki sürümde nesne süresiz önbelleğe alınıyordu → uzun süre çalışan
+        süreçte TLE hiç tazelenmiyor, geçiş tahminleri günler içinde kayıyordu."""
         if not HAVE_SKYFIELD:
             return None
-        if norad in self._sats:
-            return self._sats[norad]
+        max_age = float(self.sat_cfg.get("tle_max_age_h", 24)) * 3600
+        cached = self._sats.get(norad)
+        if cached is not None and (time.time() - self._sat_loaded.get(norad, 0)) < max_age:
+            return cached
         tle = self.get_tle(norad, name)
         if not tle:
-            return None
+            return cached  # yenilenemedi; eldeki (eski) nesneyle devam
         sat = EarthSatellite(tle[0], tle[1], name, self._ts)
         self._sats[norad] = sat
+        self._sat_loaded[norad] = time.time()
         return sat
 
     def refresh(self, norad: int, name: str = "") -> None:
@@ -177,19 +185,26 @@ class SatellitePredictor:
         out: list[Pass] = []
         rise = culm = None
         max_el = 0.0
+        now_dt = datetime.now(timezone.utc)
         for t, ev in zip(times, events):
             dt = t.utc_datetime()
             if ev == 0:
                 rise = dt
                 max_el = 0.0
             elif ev == 1:
+                if rise is None:
+                    rise = now_dt  # geçiş zaten sürüyor (başlangıçta pencere içindeyiz)
                 culm = dt
                 try:
                     alt, _, _ = (sat - self._topos).at(t).altaz()
                     max_el = alt.degrees
                 except Exception:
                     max_el = min_elev
-            elif ev == 2 and rise is not None:
+            elif ev == 2:
+                if rise is None:
+                    rise = now_dt  # yalnız batış görüldü: sürmekte olan geçişin sonu
+                    if max_el == 0.0:
+                        max_el = min_elev
                 out.append(Pass(name, rise, culm or rise, dt, max_el))
                 rise = culm = None
         return out
@@ -201,3 +216,20 @@ class SatellitePredictor:
             if p.set > now:
                 return p
         return None
+
+
+    def upcoming(self, sats: list[dict], *, hours: float = 24, limit: int = 8) -> list[Pass]:
+        """Birden çok uydu için yaklaşan geçişleri zaman sırasıyla döndürür.
+
+        sats: [{"norad": int, "name": str, "min_elevation": float}, ...]"""
+        allp: list[Pass] = []
+        now = datetime.now(timezone.utc)
+        for sd in sats:
+            try:
+                ps = self.passes(int(sd["norad"]), str(sd.get("name", sd["norad"])), hours=hours,
+                                 min_elev=float(sd.get("min_elevation", 10)))
+            except Exception:
+                continue
+            allp.extend(p for p in ps if p.set > now)
+        allp.sort(key=lambda p: p.rise)
+        return allp[:limit]

@@ -71,6 +71,8 @@ class Application:
         self.scheduler = Scheduler(cfg, self.sdr, self.targets, self.log.getChild("sched"),
                                    self.dispatcher, self.storage)
         self.scheduler._recorder = self.audio
+        self.scheduler.tworker = self.tworker          # /tara kayıtları da yazıya dökülsün
+        self.dispatcher.scheduler = self.scheduler     # susturma kontrolü
         self.summary = SummaryReporter(cfg, self.storage, self.dispatcher, self.log.getChild("sum"),
                                        self.start_time)
         self.commands = CommandHandler(cfg, self.client, self.scheduler, self.storage, self.dispatcher,
@@ -138,20 +140,34 @@ class Application:
 
     def _maintenance_loop(self):
         retention = int(self.cfg.get("paths.retention_days", 14))
+        heartbeat_h = float(self.cfg.get("telegram.heartbeat_hours", 0) or 0)
         last_cleanup = 0.0
-        last_tle = 0.0
-        tle_refresh = float(self.cfg.get("satellites.refresh_min", 60)) * 60
+        last_heartbeat = time.time()
         try:
             while not self._stop.is_set():
                 now = time.time()
                 if now - last_cleanup > 3600:
                     last_cleanup = now
                     self._cleanup(retention)
-                if self.predictor.available and now - last_tle > tle_refresh:
-                    last_tle = now
+                if heartbeat_h > 0 and now - last_heartbeat > heartbeat_h * 3600:
+                    last_heartbeat = now
+                    self._heartbeat()
                 self._stop.wait(30)
         finally:
             self.shutdown()
+
+    def _heartbeat(self):
+        try:
+            st = self.scheduler.status_dict()
+            t0 = time.time() - 3600
+            n = self.storage.events_count(t0, time.time())
+            body = (f"Dongle: {'✅' if st['device_present'] else '❌'} · Şu an: {st['current_name'] or 'boşta'} · "
+                    f"Son 1 saatte {n} olay · Kuyruk {st['queue_len']}")
+            ev = Event("Kalp Atışı", Category.SISTEM, summary=body, body=body, priority=8, target="system")
+            ev.silent = True
+            self.dispatcher.submit(ev)
+        except Exception as e:
+            self.log.debug("kalp atışı gönderilemedi: %s", e)
 
     def _cleanup(self, retention_days: int):
         try:
@@ -165,13 +181,30 @@ class Application:
                         removed += 1
                 except OSError:
                     pass
+            # DB'de izlenmeyen dosyalar (şelale/uydu PNG, geçici WAV) — mtime'a göre
+            cutoff = time.time() - retention_days * 86400
+            for base in (self.cfg.recordings_dir, self.cfg.data_dir / "tmp"):
+                try:
+                    for f in base.rglob("*"):
+                        if f.is_file() and f.stat().st_mtime < cutoff:
+                            f.unlink()
+                            removed += 1
+                except OSError:
+                    pass
             if removed:
-                self.log.info("temizlik: %d eski kayıt dosyası silindi", removed)
+                self.log.info("temizlik: %d eski dosya silindi", removed)
         except Exception as e:
             self.log.warning("temizlik hatası: %s", e)
 
     def shutdown(self):
         self.log.info("bileşenler durduruluyor…")
+        try:
+            if self.cfg.get("telegram.startup_message", True):
+                self.client.send_message(self.cfg.get("telegram.chat_id"),
+                                         "🔴 <b>RTL-SDR İzleme sistemi durduruluyor</b>",
+                                         thread_id=self.cfg.get("telegram.thread_id") or None, silent=True)
+        except Exception:
+            pass
         for comp in reversed(self.components):
             try:
                 comp.stop()

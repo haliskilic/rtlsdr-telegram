@@ -67,6 +67,11 @@ class AudioRecorder:
         self.keep_wav = bool(a.get("keep_wav", False))
         self.rec_dir = cfg.recordings_dir
         self.tmp_dir = cfg.data_dir / "tmp"
+        try:
+            from zoneinfo import ZoneInfo
+            self.tz = ZoneInfo(cfg.get("timezone", "Europe/Istanbul"))
+        except Exception:
+            self.tz = timezone.utc
 
     def record_window(self, freq_hz: int, duration_s: float, stop_event: threading.Event, *,
                       mode: str = "fm", audio_rate: int = 16000, threshold_dbfs: float = -45.0,
@@ -84,6 +89,10 @@ class AudioRecorder:
         proc = ManagedProcess(cmd, name=f"{prefix}-rtlfm", text_stdout=False,
                               log_path=self.cfg.log_dir / f"{prefix}_rtlfm.log")
         segments: list[Segment] = []
+        try:
+            self.sdr.wait_ready()
+        except Exception:
+            pass
         try:
             proc.start()
         except Exception as e:
@@ -131,14 +140,18 @@ class AudioRecorder:
 
         try:
             while time.time() < deadline and not stop_event.is_set():
-                if not proc.running:
-                    break
-                block = proc.read_stdout_bytes(block_bytes)
-                if not block:
-                    time.sleep(0.02)
+                block = proc.read_stdout_bytes(block_bytes, timeout=0.5)
+                now = time.time()
+                if block == b"":
+                    break  # EOF: rtl_fm bitti/çöktü
+                if block is None:
+                    # Veri yok (squelch kapalı ya da duraklama): sessizlik olarak işle
+                    if active and now - last_voice >= hangover_s:
+                        finalize()
+                    if not proc.running:
+                        break
                     continue
                 lvl = _rms_dbfs(block)
-                now = time.time()
                 if lvl >= threshold_dbfs:
                     if not active:
                         active = True
@@ -167,13 +180,17 @@ class AudioRecorder:
                 finalize()
         finally:
             proc.stop()
+            try:
+                self.sdr.mark_released()
+            except Exception:
+                pass
         return segments
 
     def _write_segment(self, pcm: bytes, rate: int, freq_hz: int, start_ts: float, dur: float,
                        peak: float, acc_lin: float, acc_n: int, channel, prefix) -> Segment | None:
         start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         mean = 10 * math.log10(acc_lin / acc_n) if acc_n else peak
-        stamp = start_dt.astimezone().strftime("%Y%m%d-%H%M%S")
+        stamp = start_dt.astimezone(self.tz).strftime("%Y%m%d-%H%M%S")
         base = f"{prefix}_{stamp}_{freq_hz // 1000}k"
         wav_path = self.tmp_dir / f"{base}.wav"
         wav_path.parent.mkdir(parents=True, exist_ok=True)

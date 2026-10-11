@@ -17,13 +17,13 @@ import time
 from pathlib import Path
 
 from ..events import Category, Attachment
-from .base import TargetBase
+from .base import TargetBase, audio_attachment
 
 
 class ISSTarget(TargetBase):
     NAME = "ISS"
     CATEGORY = Category.UYDU
-    CLASS = "waiting"
+    CLASS = "pass"
     DEFAULTS = {
         "enabled": True, "priority": 2, "dwell_s": 0, "period_s": 0,
         "norad": 25544, "min_elevation": 15, "lookahead_h": 12,
@@ -88,7 +88,7 @@ class ISSTarget(TargetBase):
             self._no_signal(p)
             return
         for seg in segs:
-            atts = [Attachment("voice", seg.final_path, caption="ISS 145.800 MHz")]
+            atts = [audio_attachment(seg.final_path, caption="ISS 145.800 MHz")]
             images = self._try_sstv(seg.final_path) if sstv else []
             for img in images:
                 atts.append(Attachment("photo", img, caption="ISS SSTV"))

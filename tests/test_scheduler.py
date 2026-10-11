@@ -37,6 +37,7 @@ class FakeTarget:
         self._device = device
         self.ran = False
     def needs_device(self): return self._device
+    def check_tools(self): return True
     def display_name(self): return self.KEY
     def wants_slot(self, now): return (now - (self.last_run + self.period_s)) >= 0
     def due_in(self, now): return max(0, (self.last_run + self.period_s) - now)
@@ -104,3 +105,53 @@ def test_normal_cycle_picks_overdue():
     sched, st = _sched([a, b])
     action = sched._choose_action()
     assert action[1].KEY == "ism"
+
+
+def test_waiting_class_is_in_normal_cycle():
+    """Regresyon: 'waiting' sınıfı (ADS-B/AIS/ACARS) normal döngüde çalışmalı;
+    yalnız 'pass' sınıfı (Meteor/ISS) pencereye bağlıdır."""
+    adsb = FakeTarget("adsb", Category.HAVACILIK, cls="waiting", prio=3, period=0)
+    meteor = FakeTarget("meteor", Category.UYDU, cls="pass", prio=2, period=0)
+    sched, st = _sched([adsb, meteor])
+    action = sched._choose_action()
+    assert action and action[1].KEY == "adsb"
+
+
+def test_pass_class_never_in_cycle():
+    meteor = FakeTarget("meteor", Category.UYDU, cls="pass", prio=2, period=0)
+    sched, st = _sched([meteor])
+    assert sched._choose_action() is None
+
+
+def test_missing_tools_skipped():
+    a = FakeTarget("ism", Category.ISM, period=0)
+    a.check_tools = lambda: False
+    b = FakeTarget("aprs", Category.AMATOR, prio=9, period=0)
+    sched, st = _sched([a, b])
+    action = sched._choose_action()
+    assert action and action[1].KEY == "aprs"
+
+
+def test_upcoming_passes_without_pass_targets():
+    a = FakeTarget("ism", Category.ISM, period=0)
+    sched, st = _sched([a])
+    assert sched.upcoming_passes() == []
+
+
+def test_no_starvation_long_period_never_run():
+    """Regresyon: hiç çalışmamış uzun periyotlu hedef, yakın zamanda çalışmış
+    kısa periyotlu hedefe (aynı öncelik) tercih edilmeli."""
+    short = FakeTarget("airband", Category.HAVACILIK, prio=4, period=240)
+    short.last_run = time.time() - 250          # süresi geldi ama az gecikmiş
+    long_ = FakeTarget("ais", Category.DENIZCILIK, prio=4, period=600)  # last_run=0
+    sched, st = _sched([short, long_])
+    assert sched._choose_action()[1].KEY == "ais"
+
+
+def test_lateness_ratio_prefers_relatively_later():
+    a = FakeTarget("a", Category.ISM, prio=5, period=100)
+    a.last_run = time.time() - 110            # %10 gecikmiş
+    b = FakeTarget("b", Category.ISM, prio=5, period=1000)
+    b.last_run = time.time() - 1500           # %50 gecikmiş
+    sched, st = _sched([a, b])
+    assert sched._choose_action()[1].KEY == "b"

@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..events import Event, Category, Attachment, PRIO_NORMAL
-from ..proc import ManagedProcess
+from ..events import Event, Category, Attachment, PRIO_NORMAL, esc
+from ..proc import ManagedProcess, looks_like_device_error
 
 
 @dataclass
@@ -43,7 +43,8 @@ class TargetBase:
     CATEGORY: Category = Category.TARAMA
     #: dongle'ı özel olarak gerektirir mi (tüm RF hedefleri evet)
     NEEDS_DEVICE: bool = True
-    #: "waiting" (süre ayırır) | "opportunistic" (fırsatçı)
+    #: "waiting" (frekansta süre ayırır; normal döngüde uzun dwell) |
+    #: "opportunistic" (fırsatçı) | "pass" (yalnız TLE geçiş penceresinde — uydu/ISS)
     CLASS: str = "opportunistic"
     #: hedefe özel varsayılan yapılandırma (config DEFAULTS'a kaydedilir)
     DEFAULTS: dict = {}
@@ -168,25 +169,46 @@ class TargetBase:
         log_path = None
         if log_name:
             log_path = self.cfg.log_dir / f"{log_name}.log"
-        proc = ManagedProcess(cmd, name=name or self.KEY, on_line=on_line, on_stderr=on_stderr,
-                              log_path=log_path)
         deadline = time.time() + duration_s
-        try:
-            proc.start()
-        except Exception as e:
-            self.log_error(f"araç başlatılamadı: {e}")
-            return 0
-        try:
-            while time.time() < deadline and not stop_event.is_set():
-                if not proc.running:
-                    rc = proc.returncode
-                    if rc not in (0, None):
-                        self.log.debug("%s rc=%s (erken çıkış)", name or self.KEY, rc)
-                    break
-                time.sleep(0.3)
-        finally:
-            proc.stop()
-        return proc.returncode or 0
+        attempts = 0
+        rc = 0
+        while attempts < 2:
+            attempts += 1
+            proc = ManagedProcess(cmd, name=name or self.KEY, on_line=on_line, on_stderr=on_stderr,
+                                  log_path=log_path)
+            try:
+                self.sdr.wait_ready()
+            except Exception:
+                pass
+            started = time.time()
+            try:
+                proc.start()
+            except Exception as e:
+                self.log_error(f"araç başlatılamadı: {e}")
+                return 0
+            try:
+                while time.time() < deadline and not stop_event.is_set():
+                    if not proc.running:
+                        break
+                    time.sleep(0.3)
+            finally:
+                proc.stop()
+                try:
+                    self.sdr.mark_released()
+                except Exception:
+                    pass
+            rc = proc.returncode or 0
+            early_exit = (time.time() - started) < 4.0 and not stop_event.is_set() and time.time() < deadline
+            if early_exit and looks_like_device_error(proc.stderr_tail):
+                # dongle henüz bırakılmamış olabilir — kısa bekle, bir kez daha dene
+                self.log.debug("%s: dongle meşgul görünüyor, yeniden deneniyor", name or self.KEY)
+                time.sleep(1.5)
+                continue
+            if early_exit and rc not in (0, None):
+                tail = " | ".join(list(proc.stderr_tail)[-3:])
+                self.log_error(f"{name or self.KEY} erken çıktı (rc={rc}): {tail[:300]}")
+            break
+        return rc
 
     # ------------------------------------------------------- çalıştırma
     def run_slot(self, stop_event: threading.Event, duration_s: float) -> None:
@@ -198,3 +220,70 @@ class TargetBase:
         """'waiting' hedefleri için bir sonraki zamanlanmış pencere (başlangıç, bitiş) ya da None."""
         return None
 
+
+
+def audio_attachment(path: str, caption: str | None = None, delete_after: bool = False) -> Attachment:
+    """Dosya uzantısına göre doğru Telegram ek türünü seçer.
+
+    Telegram sendVoice yalnızca OGG/OPUS (veya MP3/M4A) kabul eder; WAV için
+    sendDocument kullanılmalıdır, aksi halde gönderim reddedilir."""
+    p = str(path).lower()
+    if p.endswith((".ogg", ".oga", ".opus")):
+        kind = "voice"
+    elif p.endswith((".mp3", ".m4a")):
+        kind = "audio"
+    else:
+        kind = "document"
+    return Attachment(kind, str(path), caption=caption, delete_after=delete_after)
+
+
+class SlotCollector:
+    """Bir slot boyunca biriken ögeleri tek özet mesajında (sel koruması) toplar.
+
+    Yoğun ortamlarda (havalimanı yakını ADS-B, Marmara AIS, şehir içi ISM) her
+    tespit için ayrı mesaj göndermek topic'i boğar. Bunun yerine hedef, slot
+    boyunca `add()` ile öge biriktirir; `flush()` öge sayısı `individual_max`
+    altındaysa ayrı olaylar, üstündeyse tek özet olay üretir."""
+
+    def __init__(self, target: "TargetBase", title: str, *, individual_max: int = 3, list_max: int = 15):
+        self.target = target
+        self.title = title
+        self.individual_max = individual_max
+        self.list_max = list_max
+        self.items: list[dict] = []   # {"line": str, "event": Event|None, "sort": float}
+
+    def add(self, line: str, event: Event | None = None, sort_key: float = 0.0) -> None:
+        self.items.append({"line": line, "event": event, "sort": sort_key})
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def flush(self, *, freq_mhz=None, band: str | None = None, summary_prefix: str = "",
+              extra_body: str = "", priority: int | None = None, always_summary: bool = False) -> int:
+        if not self.items:
+            return 0
+        n = len(self.items)
+        if n <= self.individual_max and not always_summary:
+            sent = 0
+            for it in self.items:
+                if it["event"] is not None:
+                    self.target.emit(it["event"])
+                    sent += 1
+            if sent:
+                self.items.clear()
+                return sent
+        items = sorted(self.items, key=lambda x: -x["sort"])
+        lines = [it["line"] for it in items[: self.list_max]]
+        more = n - len(lines)
+        body = "\n".join(lines)
+        if more > 0:
+            body += f"\n… ve {more} öge daha"
+        if extra_body:
+            body = extra_body + "\n\n" + body
+        ev = self.target.make_event(
+            self.title, summary=f"{summary_prefix}{n} öge",
+            body=body, freq_mhz=freq_mhz, band=band,
+            priority=self.target.priority if priority is None else priority)
+        self.target.emit(ev)
+        self.items.clear()
+        return 1

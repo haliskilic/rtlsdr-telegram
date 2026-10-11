@@ -319,4 +319,8 @@ class Storage:
         self._exec("DELETE FROM target_runs WHERE started<?", (cutoff,))
         self._exec("DELETE FROM errors WHERE ts<?", (cutoff,))
         self._exec("DELETE FROM queue WHERE attempts>=20")
+        # kayıt defteri: 90 gündür görülmeyen uçak/gemi/cihaz/istasyon kayıtları
+        self._exec("DELETE FROM registry WHERE last_seen<? AND kind IN "
+                   "('aircraft','ship','ism_device','aprs_station','acars_ac','vdl2_ac','spectrum_anom','sonde_carrier')",
+                   (time.time() - 90 * 86400,))
         return len(paths), paths

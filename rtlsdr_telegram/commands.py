@@ -69,6 +69,7 @@ class CommandHandler:
             "liste": self.cmd_liste, "list": self.cmd_liste,
             "yardim": self.cmd_yardim, "yardım": self.cmd_yardim, "help": self.cmd_yardim,
             "start": self.cmd_yardim,
+            "gecisler": self.cmd_gecisler, "geçişler": self.cmd_gecisler, "passes": self.cmd_gecisler,
         }
 
     # --------------------------------------------------------------- yaşam
@@ -134,14 +135,14 @@ class CommandHandler:
         if is_private and not self.allow_private:
             return
 
-        # yetki
-        if self.admins and user_id not in self.admins:
+        # yetki: yönetici listesi boşsa kimse komut çalıştıramaz (güvenli varsayılan)
+        if user_id not in self.admins:
             if self.unauthorized_reply:
-                self._reply(reply, f"⛔ Yetkiniz yok. (kullanıcı kimliğiniz: <code>{user_id}</code>)")
-            self.log.info("yetkisiz komut denemesi: %s (%s)", user_id, cmd)
+                hint = ("" if self.admins else
+                        "\nconfig.yaml → telegram.admins listesine bu kimliği ekleyip servisi yeniden başlatın.")
+                self._reply(reply, f"⛔ Yetkiniz yok. (kullanıcı kimliğiniz: <code>{user_id}</code>){hint}")
+            self.log.info("yetkisiz komut denemesi: %s (/%s)", user_id, cmd)
             return
-        if not self.admins:
-            self.log.warning("yönetici tanımlı değil; komut yine de işleniyor (kullanıcı %s)", user_id)
 
         self.log.info("komut: /%s %s (kullanıcı %s)", cmd, " ".join(args), user_id)
         handler(args, reply, user_id)
@@ -171,6 +172,8 @@ class CommandHandler:
             lines.append(f"   └ dinlenen: {s['current_freq']} ({int(s['current_since_s'])} sn)")
         if s["next_info"]:
             lines.append(f"⏭️ Sıradaki: {s['next_info']}")
+        if s.get("next_pass_info"):
+            lines.append(f"🛰️ Uydu: {s['next_pass_info']}")
         lines.append(f"📨 Kuyruk: {s['queue_len']} mesaj bekliyor")
         lines.append("")
         lines.append(f"✅ Aktif hedef: {len(active)}/{len(self.sched.targets)}")
@@ -283,9 +286,16 @@ class CommandHandler:
             if tr:
                 cap += f"\n📝 {tr[:300]}"
             try:
-                kind = "voice" if path.endswith((".ogg", ".oga")) else "audio"
-                self.client.send_voice(reply["chat_id"], path, caption=cap[:1024],
-                                       thread_id=reply.get("message_thread_id"), silent=True)
+                low = path.lower()
+                if low.endswith((".ogg", ".oga", ".opus")):
+                    self.client.send_voice(reply["chat_id"], path, caption=cap[:1024],
+                                           thread_id=reply.get("message_thread_id"), silent=True)
+                elif low.endswith((".mp3", ".m4a")):
+                    self.client.send_audio(reply["chat_id"], path, caption=cap[:1024],
+                                           thread_id=reply.get("message_thread_id"), silent=True)
+                else:
+                    self.client.send_document(reply["chat_id"], path, caption=cap[:1024],
+                                              thread_id=reply.get("message_thread_id"), silent=True)
             except TelegramError as e:
                 self.log.warning("kayıt gönderilemedi: %s", e)
 
@@ -308,6 +318,33 @@ class CommandHandler:
         lines.append("🟢 aktif · ⚪ kapalı · 🔇 susturulmuş · ⏰ zamanlanmış · 🔄 fırsatçı")
         self._reply(reply, "\n".join(lines))
 
+    def cmd_gecisler(self, args, reply, user_id):
+        hours = 24
+        if args:
+            try:
+                hours = max(1, min(72, int(args[0])))
+            except ValueError:
+                pass
+        try:
+            passes = self.sched.upcoming_passes(hours=hours, limit=10)
+        except Exception as e:
+            self._reply(reply, f"Geçiş hesabı başarısız: {e}")
+            return
+        if not passes:
+            self._reply(reply, f"Önümüzdeki {hours} saatte uygun geçiş yok (ya da TLE/skyfield yok).")
+            return
+        from zoneinfo import ZoneInfo
+        try:
+            tz = ZoneInfo(self.cfg.get("timezone", "Europe/Istanbul"))
+        except Exception:
+            tz = timezone.utc
+        lines = [f"🛰️ <b>Yaklaşan geçişler</b> (önümüzdeki {hours} sa)", ""]
+        for p in passes:
+            r = p.rise.astimezone(tz).strftime("%d.%m %H:%M")
+            st = p.set.astimezone(tz).strftime("%H:%M")
+            lines.append(f"• {p.satellite}: {r}–{st}  maks {p.max_elevation:.0f}°  ({p.duration_s/60:.0f} dk)")
+        self._reply(reply, "\n".join(lines))
+
     def cmd_yardim(self, args, reply, user_id):
         txt = (
             "🤖 <b>RTL-SDR İzleme Botu — Komutlar</b>\n\n"
@@ -319,6 +356,7 @@ class CommandHandler:
             "/oncelik <code>&lt;hedef&gt;</code> — hedefi öne al\n"
             "/ozet — günlük özeti hemen üret\n"
             "/kayitlar <code>[n]</code> — son n kaydı yeniden gönder\n"
+            "/gecisler <code>[saat]</code> — yaklaşan uydu/ISS geçişleri\n"
             "/yardim — bu liste\n\n"
             f"Kategoriler: {', '.join(c.value for c in Category if c != Category.SISTEM)}"
         )

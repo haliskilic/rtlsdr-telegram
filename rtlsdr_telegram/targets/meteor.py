@@ -24,7 +24,7 @@ from .base import TargetBase
 class MeteorTarget(TargetBase):
     NAME = "Meteor-M Görüntü"
     CATEGORY = Category.UYDU
-    CLASS = "waiting"
+    CLASS = "pass"
     DEFAULTS = {
         "enabled": True, "priority": 2, "dwell_s": 0, "period_s": 0,
         "min_elevation": 20, "gain": 42, "samplerate": 1024000,
@@ -32,7 +32,7 @@ class MeteorTarget(TargetBase):
         "band_label": "137 MHz Meteor-M LRPT",
         "satellites": [
             {"name": "METEOR-M2 3", "norad": 57166, "freq_mhz": 137.9, "pipeline": "meteor_m2-x_lrpt"},
-            {"name": "METEOR-M2 4", "norad": 59051, "freq_mhz": 137.1, "pipeline": "meteor_m2-x_lrpt"},
+            {"name": "METEOR-M2 4", "norad": 59051, "freq_mhz": 137.1, "pipeline": "meteor_m2-x_lrpt_80k"},
         ],
         "max_images": 6,
     }

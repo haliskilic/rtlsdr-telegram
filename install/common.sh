@@ -33,6 +33,8 @@ echo ">>> Dosyalar kopyalanıyor"
 mkdir -p "$INSTALL_DIR"
 cp -r "$SRC_DIR"/rtlsdr_telegram "$SRC_DIR"/run.py "$SRC_DIR"/requirements.txt "$INSTALL_DIR"/
 [ -f "$INSTALL_DIR/config.yaml" ] || cp "$SRC_DIR/config.example.yaml" "$INSTALL_DIR/config.yaml"
+chmod 600 "$INSTALL_DIR/config.yaml"   # bot token içerir
+cp -r "$SRC_DIR"/tools "$INSTALL_DIR"/ 2>/dev/null || true
 
 # 4) Python sanal ortamı (apt paketlerini de görsün)
 echo ">>> Python sanal ortamı"

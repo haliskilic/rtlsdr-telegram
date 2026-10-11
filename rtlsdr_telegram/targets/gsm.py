@@ -34,7 +34,7 @@ class GSMTarget(TargetBase):
     CATEGORY = Category.HUCRESEL
     CLASS = "opportunistic"
     DEFAULTS = {
-        "enabled": True, "priority": 6, "dwell_s": 90, "period_s": 3600,
+        "enabled": True, "priority": 6, "dwell_s": 240, "period_s": 3600,
         "bands": ["GSM900", "DCS1800"], "gain": 40, "sample_rate": 2000000,
         "band_label": "GSM 900 / 1800 (yalnız kimlik)", "report_changed": True,
     }
@@ -55,7 +55,6 @@ class GSMTarget(TargetBase):
             cmd = [binary, "-b", band, "-g", str(self.conf.get("gain", 40))]
             if self.sdr.ppm:
                 cmd += ["-p", str(self.sdr.ppm)]
-            self._found = []
             self.run_tool_lines(cmd, stop_event, share, self._on_line, name=f"grgsm-{band}",
                                 log_name="grgsm")
 

@@ -9,6 +9,8 @@ Ağ kesilince gönderici hata döndürür; Dispatcher mesajı kuyrukta tutup son
 """
 from __future__ import annotations
 
+import os
+import re
 import time
 from typing import Any
 
@@ -31,6 +33,7 @@ class TelegramClient:
         self.token = token
         self.log = logger
         self.base = f"{API}/bot{token}"
+        self._tok_re = re.compile(re.escape(token)) if token else None
         kwargs: dict[str, Any] = {"timeout": httpx.Timeout(timeout, connect=15.0)}
         if proxy:
             kwargs["proxy"] = proxy
@@ -42,6 +45,11 @@ class TelegramClient:
         except Exception:
             pass
 
+    def _san(self, text: Any) -> str:
+        """Hata metinlerinden bot token'ını temizler (log sızıntısını önler)."""
+        t = str(text)
+        return self._tok_re.sub("<TOKEN>", t) if self._tok_re else t
+
     # ----------------------------------------------------------- düşük seviye
     def _call(self, method: str, *, data: dict | None = None, files: dict | None = None,
               timeout: float | None = None) -> dict:
@@ -51,9 +59,9 @@ class TelegramClient:
             r = self._client.post(url, data=payload, files=files,
                                   timeout=timeout or self._client.timeout)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.NetworkError) as e:
-            raise TelegramError(f"ağ hatası: {e}", transient=True)
+            raise TelegramError(f"ağ hatası: {self._san(e)}", transient=True)
         except httpx.HTTPError as e:
-            raise TelegramError(f"http hatası: {e}", transient=True)
+            raise TelegramError(f"http hatası: {self._san(e)}", transient=True)
         try:
             js = r.json()
         except ValueError:
@@ -92,22 +100,32 @@ class TelegramClient:
     # --------------------------------------------------------------- yardımcı
     @staticmethod
     def _split(text: str, limit: int = MSG_LIMIT) -> list[str]:
+        """Metni satır sınırlarında, her parça <= limit olacak şekilde böler."""
         if len(text) <= limit:
             return [text]
-        parts, cur = [], ""
+        parts: list[str] = []
+        cur = ""
         for line in text.split("\n"):
+            # tek satır bile limitten uzunsa önce biriktirileni boşalt, satırı dilimle
             while len(line) > limit:
-                parts.append((cur + "\n" + line[:limit]).strip() if cur else line[:limit])
+                if cur:
+                    parts.append(cur)
+                    cur = ""
+                parts.append(line[:limit])
                 line = line[limit:]
-                cur = ""
-            if len(cur) + len(line) + 1 > limit:
+            candidate = line if not cur else cur + "\n" + line
+            if len(candidate) > limit:
                 parts.append(cur)
                 cur = line
             else:
-                cur = (cur + "\n" + line) if cur else line
+                cur = candidate
         if cur:
             parts.append(cur)
-        return parts
+        return [p for p in parts if p != ""]
+
+    @staticmethod
+    def _strip_tags(text: str) -> str:
+        return re.sub(r"</?(b|i|u|s|code|pre|a|tg-spoiler)[^>]*>", "", text)
 
     # --------------------------------------------------------------- API
     def get_me(self) -> dict:
@@ -135,6 +153,7 @@ class TelegramClient:
                 # HTML ayrıştırma hatasında düz metne düş
                 if "can't parse" in str(e).lower() or "parse" in str(e).lower():
                     data.pop("parse_mode", None)
+                    data["text"] = self._strip_tags(chunk)
                     res = self._call_retry("sendMessage", data=data)
                 else:
                     raise
@@ -156,8 +175,17 @@ class TelegramClient:
         if extra:
             data.update(extra)
         with open(path, "rb") as fh:
-            files = {field: (path.split("/")[-1], fh, "application/octet-stream")}
-            res = self._call_retry(method, data=data, files=files, timeout=180)
+            files = {field: (os.path.basename(path), fh, "application/octet-stream")}
+            try:
+                res = self._call_retry(method, data=data, files=files, timeout=180)
+            except TelegramError as e:
+                if caption and "parse" in str(e).lower():
+                    data.pop("parse_mode", None)
+                    data["caption"] = self._strip_tags(caption)[:CAPTION_LIMIT]
+                    fh.seek(0)
+                    res = self._call_retry(method, data=data, files=files, timeout=180)
+                else:
+                    raise
         return res.get("message_id")
 
     def send_voice(self, chat_id, path, **kw) -> int:
