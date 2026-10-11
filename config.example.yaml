@@ -204,7 +204,7 @@ targets:
   airband:
     enabled: true
     dwell_s: 90
-    period_s: 240
+    period_s: 300
     threshold_dbfs: -38
     transcribe_language: en         # havacılık İngilizcesi
     channels:
@@ -215,7 +215,7 @@ targets:
   marine_voice:
     enabled: true
     dwell_s: 90
-    period_s: 240
+    period_s: 300
     threshold_dbfs: -40
     transcribe_language: tr
     channels:

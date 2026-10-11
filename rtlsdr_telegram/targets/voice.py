@@ -229,7 +229,7 @@ class AirbandTarget(VoiceTargetBase):
     MODE = "am"
     MAP_HINT = "air"
     DEFAULTS = {
-        "enabled": True, "priority": 4, "dwell_s": 90, "period_s": 240,
+        "enabled": True, "priority": 4, "dwell_s": 90, "period_s": 300,
         "channels": [
             {"freq_mhz": 118.100, "name": "Kule (örnek)"},
             {"freq_mhz": 121.500, "name": "Acil (Guard)"},
@@ -251,7 +251,7 @@ class MarineVoiceTarget(VoiceTargetBase):
     MODE = "fm"
     MAP_HINT = "marine"
     DEFAULTS = {
-        "enabled": True, "priority": 4, "dwell_s": 90, "period_s": 240,
+        "enabled": True, "priority": 4, "dwell_s": 90, "period_s": 300,
         "channels": [
             {"freq_mhz": 156.800, "name": "Kanal 16 (Acil/Çağrı)"},
             {"freq_mhz": 156.650, "name": "Kanal 13 (Köprü-köprü)"},

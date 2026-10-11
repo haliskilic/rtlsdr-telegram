@@ -155,3 +155,26 @@ def test_lateness_ratio_prefers_relatively_later():
     b.last_run = time.time() - 1500           # %50 gecikmiş
     sched, st = _sched([a, b])
     assert sched._choose_action()[1].KEY == "b"
+
+
+def test_initial_sweep_crosses_priorities():
+    """Hiç çalışmamış düşük öncelikli hedef, yakın zamanda çalışmış yüksek
+    öncelikli hedefe tercih edilmeli (ilk tur garantisi)."""
+    hi = FakeTarget("adsb", Category.HAVACILIK, prio=3, period=100)
+    hi.last_run = time.time() - 150
+    lo = FakeTarget("spectrum", Category.TARAMA, prio=5, period=600)  # last_run=0
+    sched, st = _sched([hi, lo])
+    assert sched._choose_action()[1].KEY == "spectrum"
+
+
+def test_aging_lets_lower_priority_run():
+    """Öncelik katı sınıf değil ağırlık: p5 hedef 2x gecikince p4'ün 1.1x gecikmesini geçer."""
+    p4 = FakeTarget("airband", Category.HAVACILIK, prio=4, period=100)
+    p4.last_run = time.time() - 110           # oran 0.1 → skor 0.025
+    p5 = FakeTarget("ism", Category.ISM, prio=5, period=100)
+    p5.last_run = time.time() - 300           # oran 2.0 → skor 0.4
+    sched, st = _sched([p4, p5])
+    assert sched._choose_action()[1].KEY == "ism"
+    # ama p4 yeterince gecikmişse yine o kazanır
+    p4.last_run = time.time() - 400           # oran 3.0 → skor 0.75
+    assert sched._choose_action()[1].KEY == "airband"

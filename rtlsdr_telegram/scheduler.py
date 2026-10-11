@@ -211,18 +211,22 @@ class Scheduler:
             overdue = now - (t.last_run + t.period_s)
             if overdue < 0:
                 continue
-            # Gecikmeyi periyoda ORANLA: mutlak saniye kullanılırsa hiç çalışmamış
-            # (last_run=0) hedefler arasında periyodu en kısa olan hep "en gecikmiş"
-            # görünür ve uzun periyotlular (AIS/ACARS/radyosonda) açlığa düşer.
+            # Adil zamanlama (yaşlandırma): tek dongle'a tüm periyotlar sığmaz; öncelik
+            # katı bir sınıf olarak uygulanırsa 3–4 öncelikli hedefler hep "süresi gelmiş"
+            # olur ve 5–6 öncelikliler (ISM/APRS/spektrum/GSM) hiç sıra alamaz.
+            # Skor = (gecikme / periyot) / öncelik  → düşük öncelikli hedef, orantılı
+            # olarak daha çok gecikince sırayı alır. Hiç çalışmamış hedef her zaman önce
+            # (ilk tur garantisi, öncelikten bağımsız; eşitlikte öncelik + config sırası).
             if t.last_run <= 0:
-                lateness = float("inf")           # hiç çalışmadı: ilk tur garantili
+                score = float("inf")
             else:
-                lateness = overdue / max(1.0, t.period_s)
-            candidates.append((t.priority, -lateness if lateness != float("inf") else -1e18, t))
+                score = (overdue / max(1.0, t.period_s)) / max(1, int(t.priority))
+            candidates.append((score, t))
         if candidates:
-            candidates.sort(key=lambda x: (x[0], x[1]))   # kararlı sıralama: eşitlikte config sırası
+            candidates.sort(key=lambda x: (0 if x[0] == float("inf") else 1, -x[0] if x[0] != float("inf") else 0,
+                                           x[1].priority))
             self._set_next(candidates)
-            return ("target", candidates[0][2], "normal")
+            return ("target", candidates[0][1], "normal")
         # f) cihaz gerektirmeyen hedefler (radiosonde auto_rx) — boşta çalıştır
         for t in self.targets:
             if t.enabled and not self.is_muted(t.CATEGORY) and not t.needs_device() and t.wants_slot(now):
@@ -253,7 +257,7 @@ class Scheduler:
 
     def _set_next(self, candidates):
         if len(candidates) > 1:
-            nxt = candidates[1][2]
+            nxt = candidates[1][1]
             self.state.next_target = nxt.KEY
             self.state.next_info = f"{nxt.display_name()} ({nxt.band_label})"
 
